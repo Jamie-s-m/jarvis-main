@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Advanced Local AI Agent (Jarvis) - Dynamic Plugin, Barge-In Interruption & Self-Evolution Architecture
+Advanced Local AI Agent (Jarvis) - Auto-Package Installation Edition
 """
 
 from __future__ import annotations
 
 import ast
 import contextlib
-import importlib.util
 import io
 import json
 import logging
 import os
-import platform
 import re
 import subprocess
 import sys
@@ -24,12 +22,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 import ollama
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
 
 try:
     import pyttsx3
@@ -47,34 +39,21 @@ except ImportError:
 OLLAMA_MODEL = "llama3.1"
 WAKE_WORD = "jarvis"
 STT_LANGUAGE = "en-US"
-BASE_DIR = Path(__file__).resolve().parent
-MEMORY_FILE = BASE_DIR / "jarvis_memory.json"
-REQUIREMENTS_FILE = BASE_DIR / "requirements.txt"
-CUSTOM_TOOLS_FILE = BASE_DIR / "custom_tools.py"
+MEMORY_FILE = Path("jarvis_memory.json")
+REQUIREMENTS_FILE = Path("requirements.txt")
+JARVIS_SCRIPT = Path(__file__).resolve()
 
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(JARVIS_SCRIPT.parent / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("jarvis")
 
-# Speech state & barge-in control
 speaking_lock = threading.Lock()
-stop_speaking_flag = threading.Event()
 is_speaking = False
-
-IMPORT_TO_PYPI_MAP = {
-    "cv2": "opencv-python",
-    "PIL": "pillow",
-    "fitz": "pymupdf",
-    "bs4": "beautifulsoup4",
-    "sklearn": "scikit-learn",
-    "yaml": "pyyaml",
-    "psutil": "psutil"
-}
 
 # --- Memory Engine -----------------------------------------------------------
 
@@ -95,24 +74,15 @@ def save_memory(memory_data: dict) -> None:
     except Exception as e:
         log.error("Failed to save memory: %s", e)
 
-# --- Interruptible Speech Engine (Barge-In) ------------------------------------
-
-def stop_speech() -> None:
-    """Instantly halts any active speech output."""
-    global is_speaking
-    if is_speaking:
-        stop_speaking_flag.set()
-        log.info("Interruption triggered: Speech output halted.")
+# --- Speech Engine -----------------------------------------------------------
 
 def speak(text: str) -> None:
-    """Synthesizes audio with barge-in support (can be interrupted anytime)."""
-    if not HAS_TTS or not text.strip():
+    """Synthesizes English spoken audio, prioritizing Microsoft Andrew."""
+    if not HAS_TTS:
         return
 
     def _tts_thread():
         global is_speaking
-        stop_speaking_flag.clear()
-        
         with speaking_lock:
             is_speaking = True
             try:
@@ -138,43 +108,38 @@ def speak(text: str) -> None:
                 
                 if selected_voice:
                     engine.setProperty('voice', selected_voice)
+                elif voices:
+                    engine.setProperty('voice', voices[0].id)
 
-                # Process sentence by sentence for prompt responsiveness to interruptions
-                sentences = re.split(r'(?<=[.!?]) +', text)
-                for sentence in sentences:
-                    if stop_speaking_flag.is_set():
-                        break
-                    if sentence.strip():
-                        engine.say(sentence)
-                        engine.runAndWait()
-                        
+                engine.say(text)
+                engine.runAndWait()
             except Exception as e:
                 log.error("TTS error: %s", e)
             finally:
+                time.sleep(0.3)
                 is_speaking = False
-                stop_speaking_flag.clear()
 
     threading.Thread(target=_tts_thread, daemon=True).start()
 
-# --- Core Tools Engine -------------------------------------------------------
+# --- Built-In Core Tools -----------------------------------------------------
 
 def install_package(package_name: str) -> str:
-    """Installs target Python library using pip in the local environment."""
-    target_pkg = IMPORT_TO_PYPI_MAP.get(package_name, package_name)
-    log.info("Attempting installation for package: %s (PyPI: %s)", package_name, target_pkg)
+    """Installs target Python library using pip in the local virtual environment."""
+    log.info("Attempting installation for package: %s", package_name)
     try:
-        cmd = [sys.executable, "-m", "pip", "install", target_pkg]
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        cmd = [sys.executable, "-m", "pip", "install", package_name]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         
+        # Append to requirements.txt if present
         if REQUIREMENTS_FILE.exists():
             existing = REQUIREMENTS_FILE.read_text(encoding="utf-8")
-            if target_pkg.lower() not in existing.lower():
-                REQUIREMENTS_FILE.write_text(existing.strip() + f"\n{target_pkg}\n", encoding="utf-8")
+            if package_name.lower() not in existing.lower():
+                REQUIREMENTS_FILE.write_text(existing.strip() + f"\n{package_name}\n", encoding="utf-8")
 
-        return f"Package '{target_pkg}' installed successfully."
+        return f"Package '{package_name}' installed successfully."
     except subprocess.CalledProcessError as e:
         log.error("Package installation failed: %s", e.stderr)
-        return f"Failed to install '{target_pkg}': {e.stderr}"
+        return f"Failed to install '{package_name}': {e.stderr}"
 
 def get_weather(location: str = "Tashkent") -> str:
     """Fetches weather details via wttr.in."""
@@ -190,20 +155,20 @@ def get_weather(location: str = "Tashkent") -> str:
         return f"Could not retrieve weather data for {location}."
 
 def execute_python_code(code: str) -> str:
-    """Executes target Python code inside an isolated local runtime scope."""
+    """Executes target Python code inside local runtime scope."""
     f = io.StringIO()
     local_scope = {}
     try:
         with contextlib.redirect_stdout(f):
-            exec(code, {"__builtins__": __builtins__}, local_scope)
+            exec(code, globals(), local_scope)
         output = f.getvalue().strip()
         result_val = local_scope.get('result', 'Done')
         return f"Execution successful. Output: {output if output else result_val}"
     except ModuleNotFoundError as e:
         missing_mod = e.name
         log.info("Missing dependency detected: %s. Auto-installing...", missing_mod)
-        install_package(missing_mod)
-        return f"Installed missing package '{missing_mod}'. Please retry execution."
+        install_res = install_package(missing_mod)
+        return f"Installed missing package '{missing_mod}'. Please retry request."
     except Exception as e:
         return f"Python execution error: {e}"
 
@@ -229,107 +194,17 @@ def open_web_or_app(target: str) -> str:
         os.system(f"open '{target}'")
     return f"Launched {target}."
 
-def execute_system_command(command: str) -> str:
-    """Executes system CLI/Terminal commands and returns output."""
-    try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=15)
-        out = res.stdout.strip() or res.stderr.strip()
-        return out if out else "Command executed successfully with no output."
-    except Exception as e:
-        return f"Command execution failed: {e}"
-
-def get_system_status() -> str:
-    """Retrieves system resource consumption (CPU, Memory, Disk)."""
-    if not HAS_PSUTIL:
-        install_package("psutil")
-        return "Installed psutil dependency. Please invoke status check again."
-    
-    cpu = psutil.cpu_percent(interval=0.5)
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    
-    return (
-        f"System Status ({platform.system()} {platform.release()}):\n"
-        f"- CPU Utilization: {cpu}%\n"
-        f"- RAM Usage: {mem.percent}% ({mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB)\n"
-        f"- Disk Storage: {disk.percent}% used ({disk.free // (1024**3)}GB free)"
-    )
-
-def read_file(file_path: str) -> str:
-    """Reads content from a specified file."""
-    p = Path(file_path)
-    if not p.exists():
-        return f"Error: File '{file_path}' does not exist."
-    try:
-        return p.read_text(encoding="utf-8")
-    except Exception as e:
-        return f"Failed to read file: {e}"
-
-def write_file(file_path: str, content: str) -> str:
-    """Writes or overwrites text content to a target file."""
-    try:
-        p = Path(file_path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return f"File '{file_path}' successfully written."
-    except Exception as e:
-        return f"Failed to write file: {e}"
-
-def list_directory(dir_path: str = ".") -> str:
-    """Lists files and folders inside a given directory."""
-    try:
-        p = Path(dir_path)
-        if not p.exists():
-            return f"Directory '{dir_path}' does not exist."
-        items = [f.name + ("/" if f.is_dir() else "") for f in p.iterdir()]
-        return "\n".join(items) if items else "Directory is empty."
-    except Exception as e:
-        return f"Failed to list directory: {e}"
-
-BUILTIN_TOOLS = {
+AVAILABLE_TOOLS = {
     "install_package": install_package,
     "get_weather": get_weather,
     "execute_python_code": execute_python_code,
     "open_web_or_app": open_web_or_app,
-    "execute_system_command": execute_system_command,
-    "get_system_status": get_system_status,
-    "read_file": read_file,
-    "write_file": write_file,
-    "list_directory": list_directory,
 }
-
-# --- Dynamic Plugin Loader --------------------------------------------------
-
-def load_custom_tools() -> dict:
-    """Dynamically imports user-evolved functions from custom_tools.py."""
-    custom_tools = {}
-    if not CUSTOM_TOOLS_FILE.exists():
-        CUSTOM_TOOLS_FILE.write_text("# Dynamic Custom Tools Module\n", encoding="utf-8")
-        return custom_tools
-
-    try:
-        spec = importlib.util.spec_from_file_location("custom_tools", CUSTOM_TOOLS_FILE)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            for attr_name in dir(module):
-                attr = getattr(module, attr_name)
-                if callable(attr) and not attr_name.startswith("_"):
-                    custom_tools[attr_name] = attr
-    except Exception as e:
-        log.error("Failed to load custom tools module: %s", e)
-
-    return custom_tools
-
-def get_all_tools() -> dict:
-    """Returns combined registry of built-in and dynamic custom tools."""
-    tools = BUILTIN_TOOLS.copy()
-    tools.update(load_custom_tools())
-    return tools
 
 # --- Self-Evolution Engine --------------------------------------------------
 
 def extract_python_code(text: str) -> str:
+    """Extracts raw python code blocks from model response."""
     match = re.search(r"```python\s*(.*?)\s*```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -339,23 +214,25 @@ def extract_python_code(text: str) -> str:
     return text.strip()
 
 def run_self_evolution(user_instruction: str) -> str:
-    """Safely synthesizes and appends python tools to custom_tools.py."""
+    """Handles code modification or system profile updates safely."""
     log.info("Initiating modular self-evolution routine...")
 
+    # Handle system prompt behavior updates via memory directly
     if any(term in user_instruction.lower() for term in ["brief", "formal", "tone", "style", "personality"]):
         memory = load_memory()
-        memory["user_profile"] = f"User instruction: {user_instruction}. Ensure responses are concise, direct, brief, and formal."
+        memory["user_profile"] = f"User instruction: {user_instruction}. Ensure responses are extremely concise, direct, brief, and formal."
         save_memory(memory)
         speak("System preferences updated successfully.")
         return "System preferences updated. Communication style modified."
 
     speak("Initiating code modification sequence.")
-    
+    current_code = JARVIS_SCRIPT.read_text(encoding="utf-8")
+
     evolution_prompt = (
-        f"Generate a single standalone Python function with type hints and docstrings to satisfy this request: {user_instruction}\n"
+        f"Generate a single standalone Python function to satisfy this request: {user_instruction}\n"
         f"OUTPUT REQUIREMENTS:\n"
         f"- Output ONLY valid Python source code in a ```python ... ``` markdown block.\n"
-        f"- Do NOT include conversational sentences, test code, or explanations."
+        f"- Do NOT include conversational sentences or explanations."
     )
 
     try:
@@ -368,6 +245,7 @@ def run_self_evolution(user_instruction: str) -> str:
         reply = response.get("message", {}).get("content", "")
         extracted_code = extract_python_code(reply)
 
+        # Detect top-level imports and install missing dependencies prior to AST validation
         parsed_temp = ast.parse(extracted_code)
         for node in ast.walk(parsed_temp):
             if isinstance(node, ast.Import):
@@ -386,6 +264,7 @@ def run_self_evolution(user_instruction: str) -> str:
         parsed_ast = ast.parse(extracted_code)
         clean_code = ast.unparse(parsed_ast)
 
+        # Find extracted function definition
         func_name = None
         for node in parsed_ast.body:
             if isinstance(node, ast.FunctionDef):
@@ -393,16 +272,28 @@ def run_self_evolution(user_instruction: str) -> str:
                 break
 
         if not func_name:
-            return "Self-evolution aborted: No top-level Python function defined."
+            return "Self-evolution aborted: No top-level Python function found."
 
-        existing_custom = CUSTOM_TOOLS_FILE.read_text(encoding="utf-8") if CUSTOM_TOOLS_FILE.exists() else ""
-        new_custom_content = existing_custom + f"\n\n{clean_code}\n"
-        
-        ast.parse(new_custom_content)
-        CUSTOM_TOOLS_FILE.write_text(new_custom_content, encoding="utf-8")
+        # Inject tool cleanly into AVAILABLE_TOOLS dictionary
+        target_str = "AVAILABLE_TOOLS = {"
+        if target_str in current_code:
+            dict_entry = f'    "{func_name}": {func_name},\n'
+            replacement = clean_code + "\n\n" + target_str + "\n" + dict_entry
+            updated_code = current_code.replace(target_str, replacement, 1)
+        else:
+            updated_code = current_code + "\n\n" + clean_code
 
-        speak(f"New tool '{func_name}' integrated successfully.")
-        return f"Self-upgrade successful. Function '{func_name}' dynamically registered into custom_tools.py."
+        # Full AST check on merged source file
+        ast.parse(updated_code)
+
+        # Save backup and update script
+        backup_path = JARVIS_SCRIPT.with_suffix(".py.bak")
+        backup_path.write_text(current_code, encoding="utf-8")
+        JARVIS_SCRIPT.write_text(updated_code, encoding="utf-8")
+
+        speak("Upgrade validated and applied. Restarting Jarvis.")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+        return "Upgrade successfully applied."
 
     except SyntaxError as se:
         log.error("Syntax error during AST parse: %s", se)
@@ -411,29 +302,25 @@ def run_self_evolution(user_instruction: str) -> str:
         log.error("Self-evolution error: %s", e)
         return f"Self-upgrade failed: {e}"
 
-# --- Processing Pipeline -----------------------------------------------------
+# --- Agent Processing Engine ------------------------------------------------
 
 def process_user_query(query: str) -> None:
-    # Interrupt any active speech before processing a new query
-    stop_speech()
-    
     memory = load_memory()
     log.info("Processing Query: %s", query)
 
-    upgrade_keywords = ["develop yourself", "upgrade yourself", "modify your code", "update your code", "add tool"]
+    upgrade_keywords = ["develop yourself", "upgrade yourself", "modify your code", "update your code"]
     if any(kw in query.lower() for kw in upgrade_keywords):
         result = run_self_evolution(query)
         print(f"\nJarvis: {result}\n")
         speak(result)
         return
 
-    all_tools = get_all_tools()
     profile_context = memory.get("user_profile", "")
     system_prompt = (
-        f"You are Jarvis, an advanced AI assistant.\n"
+        f"You are Jarvis, a local AI assistant.\n"
         f"BEHAVIORAL DIRECTIVES: {profile_context}\n"
         f"1. Keep responses brief, formal, direct, and strictly in English.\n"
-        f"2. Utilize available tools whenever required to execute actions."
+        f"2. Use 'install_package' to download missing Python dependencies when needed."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -445,7 +332,7 @@ def process_user_query(query: str) -> None:
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=messages,
-            tools=list(all_tools.values()),
+            tools=list(AVAILABLE_TOOLS.values()),
             options={"num_predict": 2048}
         )
 
@@ -458,9 +345,9 @@ def process_user_query(query: str) -> None:
                 func_name = tool_call["function"]["name"]
                 func_args = tool_call["function"]["arguments"]
 
-                if func_name in all_tools:
+                if func_name in AVAILABLE_TOOLS:
                     log.info("Executing tool: %s with args: %s", func_name, func_args)
-                    res = all_tools[func_name](**func_args)
+                    res = AVAILABLE_TOOLS[func_name](**func_args)
                     
                     messages.append({
                         "role": "tool",
@@ -491,26 +378,35 @@ def process_user_query(query: str) -> None:
 
 def listen_and_run() -> None:
     if not HAS_STT:
-        log.error("SpeechRecognition unavailable. Running terminal mode.")
+        log.error("SpeechRecognition unavailable. Please run terminal input mode.")
         return
 
     recognizer = sr.Recognizer()
     mic = sr.Microphone()
 
-    log.info("Jarvis active. Listening continuously...")
+    log.info("Jarvis engine active. Listening for wake word...")
 
     while True:
+        if is_speaking:
+            time.sleep(0.1)
+            continue
+
         try:
             with mic as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                recognizer.adjust_for_ambient_noise(source, duration=0.3)
                 audio = recognizer.listen(source, phrase_time_limit=4)
             
+            if is_speaking:
+                continue
+
             text = recognizer.recognize_google(audio, language=STT_LANGUAGE).lower()
 
             if WAKE_WORD in text:
-                stop_speech()  # Interrupt immediately when wake word is detected
-                speak("At your service.")
-                print("\n[Jarvis Listening for command...]")
+                speak("At your service, sir.")
+                print("\n[Jarvis Active] Listening...")
+
+                while is_speaking:
+                    time.sleep(0.05)
 
                 with mic as source:
                     command_audio = recognizer.listen(source, phrase_time_limit=8)
@@ -521,23 +417,17 @@ def listen_and_run() -> None:
         except sr.UnknownValueError:
             pass
         except Exception as e:
-            log.error("Voice listener error: %s", e)
-
-def terminal_input_loop() -> None:
-    """Allows typing inputs in terminal and interrupting speech output instantaneously."""
-    speak("Jarvis initialized.")
-    while True:
-        try:
-            user_in = input("\nYou: ")
-            if user_in.strip():
-                stop_speech()  # Interruption signal upon submitting input
-                process_user_query(user_in)
-        except (KeyboardInterrupt, EOFError):
-            break
+            log.error("Voice listener loop error: %s", e)
 
 if __name__ == "__main__":
     if HAS_STT:
-        threading.Thread(target=listen_and_run, daemon=True).start()
-        terminal_input_loop()
+        listen_and_run()
     else:
-        terminal_input_loop()
+        speak("Jarvis terminal mode active.")
+        while True:
+            try:
+                user_in = input("You: ")
+                if user_in.strip():
+                    process_user_query(user_in)
+            except (KeyboardInterrupt, EOFError):
+                break
