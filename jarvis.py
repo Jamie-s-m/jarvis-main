@@ -7,7 +7,7 @@ import numpy as np
 # Audio configuration
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
-THRESHOLD = 500  # Adjust based on your environment
+THRESHOLD = 100  # Adjust based on your environment
 
 def execute_shell_command(command: str):
     try:
