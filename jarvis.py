@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Desktop Clap Assistant (Jarvis) with Ollama Agent, Tool Calling & Voice Speech
+Fully Functional Local AI Agent (Jarvis)
 
-Detects double claps using adaptive noise floor tracking, speaks a verbal greeting,
-then triggers a local AI agent (Ollama llama3) that can execute tools and respond aloud.
+Features:
+- Continuous Wake-Word Detection ("Hey Jarvis")
+- Speech-to-Text via SpeechRecognition & Text-to-Speech via pyttsx3 (Male Voice)
+- Persistent JSON Conversation & Fact Memory
+- Dynamic System Tool Calling (Shell Commands, App Launch, File Ops)
+- Self-Evolution Module (Analyzes user conversations to learn preferences over time)
 """
 
 from __future__ import annotations
@@ -20,39 +24,25 @@ import webbrowser
 from pathlib import Path
 
 from dotenv import load_dotenv
-import numpy as np
 import ollama
-import sounddevice as sd
 
-# Try importing offline TTS engine
+# Speech & Voice Libraries
 try:
     import pyttsx3
     HAS_TTS = True
 except ImportError:
     HAS_TTS = False
 
-# --- Detection Tuning Knobs ---------------------------------------------------
-SAMPLE_RATE = 44100
-BLOCK_MS = 40
-CHANNELS = 1
+try:
+    import speech_recognition as sr
+    HAS_STT = True
+except ImportError:
+    HAS_STT = False
 
-SPIKE_RATIO = 7.0
-COOLDOWN_S = 0.45
-MIN_DOUBLE_GAP_S = 0.05
-MAX_DOUBLE_GAP_S = 0.35
-RETRIGGER_RATIO = 0.55
-NOISE_FLOOR_ALPHA = 0.992
-MIN_RMS = 0.012
-QUIET_GATE_MULT = 2.2
-
-INPUT_PROBE_S = 0.5
-INPUT_SILENT_RMS = 0.001
-
-# --- Ollama Agent Setup -------------------------------------------------------
+# --- Configuration & Paths ---------------------------------------------------
 OLLAMA_MODEL = "llama3"
-AGENT_PROMPT = (
-    "Double clap detected. System activated. Run necessary quick checks or startup tasks."
-)
+WAKE_WORD = "jarvis"
+MEMORY_FILE = Path("jarvis_memory.json")
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -63,20 +53,68 @@ logging.basicConfig(
 )
 log = logging.getLogger("jarvis")
 
+# --- Persistent Memory & Evolution Engine -----------------------------------
 
-# --- TTS Function -------------------------------------------------------------
+def load_memory() -> dict:
+    """Loads long-term conversation history and learned profile facts."""
+    if MEMORY_FILE.exists():
+        try:
+            return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error("Failed to read memory file: %s", e)
+    return {
+        "user_profile": "User prefers concise, practical responses.",
+        "history": [],
+        "learned_facts": []
+    }
+
+def save_memory(memory_data: dict) -> None:
+    """Saves memory back to local storage."""
+    try:
+        MEMORY_FILE.write_text(json.dumps(memory_data, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.error("Failed to save memory: %s", e)
+
+def analyze_and_evolve(user_input: str, assistant_response: str) -> None:
+    """Background task: Uses Ollama to extract user preferences/facts and improve profile."""
+    memory = load_memory()
+    prompt = (
+        f"Analyze this interaction:\nUser: '{user_input}'\nJarvis: '{assistant_response}'\n"
+        f"Current User Profile: '{memory.get('user_profile', '')}'\n"
+        "Extract any new persistent user preference, fact, or instruction if present. "
+        "Return ONLY a revised, concise single-paragraph User Profile incorporating new learnings."
+    )
+    try:
+        res = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        new_profile = res.get("message", {}).get("content", "").strip()
+        if new_profile and len(new_profile) > 10:
+            memory["user_profile"] = new_profile
+            save_memory(memory)
+            log.info("Jarvis updated its profile memory.")
+    except Exception as e:
+        log.warning("Self-evolution analysis skipped: %s", e)
+
+# --- Voice / TTS Engine ------------------------------------------------------
 
 def speak(text: str) -> None:
-    """Speaks text using system TTS without blocking the main execution loop."""
+    """Speaks text using system TTS in a male voice."""
     if not HAS_TTS:
-        log.warning("pyttsx3 not installed. Run `pip install pyttsx3` for voice output.")
+        log.warning("pyttsx3 not installed. Run `pip install pyttsx3`.")
         return
 
     def _tts_thread():
         try:
             engine = pyttsx3.init()
-            engine.setProperty('rate', 175)  # Speaking speed WPM
+            engine.setProperty('rate', 170)
             engine.setProperty('volume', 1.0)
+            voices = engine.getProperty('voices')
+            for voice in voices:
+                if 'male' in voice.name.lower() or 'david' in voice.name.lower():
+                    engine.setProperty('voice', voice.id)
+                    break
             engine.say(text)
             engine.runAndWait()
         except Exception as e:
@@ -84,23 +122,20 @@ def speak(text: str) -> None:
 
     threading.Thread(target=_tts_thread, daemon=True).start()
 
-
-# --- System Tools for Ollama Agent --------------------------------------------
+# --- Local Tools / System Execution ----------------------------------------
 
 def execute_shell(command: str) -> str:
-    """Executes a system shell command safely and returns the output."""
+    """Executes shell or terminal commands."""
     try:
         res = subprocess.run(
             command, shell=True, capture_output=True, text=True, timeout=30
         )
-        out = res.stdout if res.returncode == 0 else res.stderr
-        return out.strip() or "Command executed successfully with no output."
+        return (res.stdout or res.stderr).strip() or "Command completed."
     except Exception as e:
-        return f"Shell execution failed: {e}"
-
+        return f"Shell error: {e}"
 
 def launch_application(app_name: str) -> str:
-    """Launches local applications like Cursor, VS Code, Chrome, or Spotify."""
+    """Launches local applications."""
     app = app_name.lower().strip()
     try:
         if app in ["cursor", "code", "vscode"]:
@@ -110,13 +145,11 @@ def launch_application(app_name: str) -> str:
                 exe = os.path.join(local, "Programs", "cursor", "Cursor.exe")
             if exe and os.path.exists(exe):
                 subprocess.Popen([exe])
-                return f"Successfully launched {app_name}."
-            return f"Could not locate executable for {app_name}."
-
+                return f"Opened {app_name}."
+            return f"Executable for {app_name} not found."
         elif app in ["chrome", "browser"]:
-            webbrowser.open("https://claude.ai")
-            return "Opened Chrome."
-
+            webbrowser.open("https://google.com")
+            return "Opened Web Browser."
         else:
             if sys.platform == "win32":
                 os.startfile(app_name)
@@ -124,89 +157,61 @@ def launch_application(app_name: str) -> str:
                 subprocess.Popen([app_name])
             return f"Launched {app_name}."
     except Exception as e:
-        return f"Failed to launch {app_name}: {e}"
-
+        return f"Failed to open {app_name}: {e}"
 
 def manage_file(action: str, path: str, content: str = "") -> str:
-    """Reads, writes, or checks local files. Action can be 'read', 'write', or 'exists'."""
+    """Reads, writes, or verifies files."""
     p = Path(path).expanduser().resolve()
     try:
         if action == "read":
-            return p.read_text(encoding="utf-8") if p.exists() else "File not found."
+            return p.read_text(encoding="utf-8") if p.exists() else "File missing."
         elif action == "write":
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
-            return f"Wrote content to {p}"
-        elif action == "exists":
-            return f"Exists: {p.exists()}"
-        return "Invalid file action specified."
+            return f"Saved file to {p}"
+        return "Invalid file action."
     except Exception as e:
-        return f"File operation error: {e}"
-
-
-def get_system_status() -> str:
-    """Returns basic system status information (OS, current path, and timestamp)."""
-    return (
-        f"OS: {sys.platform} | "
-        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"CWD: {os.getcwd()}"
-    )
-
+        return f"File error: {e}"
 
 AVAILABLE_TOOLS = {
     "execute_shell": execute_shell,
     "launch_application": launch_application,
     "manage_file": manage_file,
-    "get_system_status": get_system_status,
 }
 
+# --- Agent Processing Engine ------------------------------------------------
 
-# --- Audio Processing Helpers -------------------------------------------------
+def process_user_query(query: str) -> None:
+    """Processes user input using Ollama, tool calling, and long-term memory."""
+    memory = load_memory()
+    log.info("Processing Query: %s", query)
 
-def block_samples() -> int:
-    return max(int(SAMPLE_RATE * BLOCK_MS / 1000), 1)
+    system_prompt = (
+        "You are Jarvis, an intelligent local AI assistant. "
+        f"Learned User Context: {memory.get('user_profile', 'None')}\n"
+        "Be helpful, direct, and concise in your responses."
+    )
 
-
-def rms_mono(block: np.ndarray) -> float:
-    if block.ndim > 1:
-        block = np.mean(block.astype(np.float64), axis=1)
-    else:
-        block = block.astype(np.float64)
-    return float(np.sqrt(np.mean(block**2))) if block.size > 0 else 0.0
-
-
-def _choose_input_device(blocksize: int) -> int:
-    default = sd.default.device[0]
-    return default if (default is not None and default >= 0) else 0
-
-
-# --- Agent Orchestration -----------------------------------------------------
-
-def run_agent_loop() -> None:
-    """Speaks greeting and invokes local Ollama LLM with tool capabilities."""
-    log.info("Agent activated via Double-Clap trigger.")
+    messages = [{"role": "system", "content": system_prompt}]
     
-    # 1. Verbal Greeting
-    speak("Welcome back. Systems online and listening.")
+    # Append recent chat history
+    for msg in memory.get("history", [])[-6:]:
+        messages.append(msg)
+    
+    messages.append({"role": "user", "content": query})
 
-    tools_list = [
-        execute_shell,
-        launch_application,
-        manage_file,
-        get_system_status,
-    ]
-
-    messages = [{"role": "user", "content": AGENT_PROMPT}]
+    tools_list = [execute_shell, launch_application, manage_file]
 
     try:
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=messages,
-            tools=tools_list,
+            tools=tools_list
         )
 
         msg = response.get("message", {})
         tool_calls = msg.get("tool_calls", [])
+        final_text = ""
 
         if tool_calls:
             for tool_call in tool_calls:
@@ -214,85 +219,81 @@ def run_agent_loop() -> None:
                 func_args = tool_call["function"]["arguments"]
 
                 if func_name in AVAILABLE_TOOLS:
-                    log.info("Agent executing tool '%s' with args %s", func_name, func_args)
-                    result = AVAILABLE_TOOLS[func_name](**func_args)
-                    log.info("Tool Result: %s", result)
-                    speak(f"Executed {func_name}.")
+                    log.info("Running tool %s", func_name)
+                    res = AVAILABLE_TOOLS[func_name](**func_args)
+                    final_text = f"Executed {func_name}. Result: {res}"
         else:
-            response_text = msg.get("content", "")
-            log.info("Agent Response: %s", response_text)
-            if response_text:
-                speak(response_text)
+            final_text = msg.get("content", "")
+
+        if final_text:
+            print(f"\nJarvis: {final_text}\n")
+            speak(final_text)
+
+            # Save conversation to long-term memory
+            memory["history"].append({"role": "user", "content": query})
+            memory["history"].append({"role": "assistant", "content": final_text})
+            save_memory(memory)
+
+            # Trigger background evolution
+            threading.Thread(
+                target=analyze_and_evolve, args=(query, final_text), daemon=True
+            ).start()
 
     except Exception as e:
-        log.error("Ollama execution failed: %s", e)
+        log.error("Agent processing failed: %s", e)
 
+# --- Speech Recognition Loop ------------------------------------------------
 
-def run_double_clap_actions() -> None:
-    threading.Thread(target=run_agent_loop, daemon=True).start()
+def listen_and_run() -> None:
+    """Continuously monitors microphone for 'Hey Jarvis' or direct input."""
+    if not HAS_STT:
+        log.error("SpeechRecognition library missing. Run `pip install SpeechRecognition pyaudio`.")
+        return
 
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
 
-# --- Main Detection Loop -----------------------------------------------------
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source, duration=1)
 
-def main() -> None:
-    bs = block_samples()
-    dev_idx = _choose_input_device(bs)
+    log.info("Jarvis voice interface online. Say 'Hey Jarvis'...")
 
-    noise_floor = MIN_RMS
-    armed = True
-    first_clap_time: float | None = None
-    last_trigger_time = 0.0
+    while True:
+        try:
+            with mic as source:
+                audio = recognizer.listen(source, phrase_time_limit=5)
+            
+            text = recognizer.recognize_google(audio).lower()
+            log.debug("Heard: %s", text)
 
-    log.info("Jarvis system online. Listening for double claps...")
+            if WAKE_WORD in text:
+                speak("Yes sir, how can I help?")
+                print("\n[Jarvis Activated] Listening for your command...")
 
-    def callback(indata: np.ndarray, _frames: int, _time: dict, status: sd.CallbackFlags) -> None:
-        nonlocal noise_floor, armed, first_clap_time, last_trigger_time
+                with mic as source:
+                    command_audio = recognizer.listen(source, phrase_time_limit=10)
+                
+                command = recognizer.recognize_google(command_audio)
+                process_user_query(command)
 
-        r = rms_mono(indata)
-        now = time.monotonic()
-
-        if r < noise_floor * QUIET_GATE_MULT:
-            noise_floor = NOISE_FLOOR_ALPHA * noise_floor + (1.0 - NOISE_FLOOR_ALPHA) * r
-            noise_floor = max(noise_floor, 1e-5)
-
-        threshold = max(noise_floor * SPIKE_RATIO, MIN_RMS)
-
-        if not armed and r < (threshold * RETRIGGER_RATIO):
-            armed = True
-
-        if armed and r >= threshold:
-            armed = False
-            if now - last_trigger_time < COOLDOWN_S:
-                return
-
-            if first_clap_time is None:
-                first_clap_time = now
-            else:
-                gap = now - first_clap_time
-                if MIN_DOUBLE_GAP_S <= gap <= MAX_DOUBLE_GAP_S:
-                    last_trigger_time = now
-                    first_clap_time = None
-                    run_double_clap_actions()
-                else:
-                    first_clap_time = now
-
-        if first_clap_time and (now - first_clap_time) > MAX_DOUBLE_GAP_S:
-            first_clap_time = None
-
-    try:
-        with sd.InputStream(
-            device=dev_idx,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=bs,
-            callback=callback,
-        ):
-            while True:
-                time.sleep(0.1)
-    except KeyboardInterrupt:
-        log.info("Jarvis shutting down.")
-
+        except sr.UnknownValueError:
+            pass
+        except sr.RequestError as e:
+            log.error("Speech service error: %s", e)
+        except Exception as e:
+            log.error("Listening error: %s", e)
 
 if __name__ == "__main__":
-    main()
+    if HAS_STT:
+        listen_and_run()
+    else:
+        # Fallback interactive terminal mode
+        print("SpeechRecognition not found. Running in interactive terminal mode.")
+        speak("Jarvis terminal mode activated.")
+        while True:
+            try:
+                user_in = input("You: ")
+                if user_in.strip():
+                    process_user_query(user_in)
+            except (KeyboardInterrupt, EOFError):
+                break
