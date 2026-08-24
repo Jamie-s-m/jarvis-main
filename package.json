@@ -1,0 +1,29 @@
+{
+  "name": "jarvis-electron",
+  "version": "1.0.0",
+  "description": "JARVIS cinematic desktop wrapper (Electron)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "author": "Jarvis",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^26.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.local.jarvis",
+    "productName": "JARVIS AI Agent",
+    "files": [
+      "**/*",
+      "!node_modules/**/*",
+      "!dist/*.exe"
+    ],
+    "win": {
+      "target": ["nsis", "portable"]
+    }
+  }
+}

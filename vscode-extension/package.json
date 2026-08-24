@@ -1,0 +1,57 @@
+{
+  "name": "jarvis-vscode",
+  "displayName": "JARVIS HUD & Chat",
+  "description": "Integrates the local JARVIS AI Agent with VS Code: chat participant and cinematic HUD sidebar.",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:jarvis.startEngine",
+    "onView:jarvisHud"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jarvis.startEngine",
+        "title": "JARVIS: Start Engine"
+      },
+      {
+        "command": "jarvis.stopEngine",
+        "title": "JARVIS: Stop Engine"
+      },
+      {
+        "command": "jarvis.restartEngine",
+        "title": "JARVIS: Restart Engine"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "jarvisHud",
+          "name": "JARVIS HUD"
+        }
+      ]
+    },
+    "chat": {
+      "participants": [
+        {
+          "id": "@jarvis",
+          "label": "JARVIS",
+          "detail": "Local JARVIS AI Agent"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0"
+  }
+}
