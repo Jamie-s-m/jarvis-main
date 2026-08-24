@@ -57,32 +57,91 @@ export function activate(context: vscode.ExtensionContext) {
     if (chatApi && typeof chatApi.registerChatProvider === 'function') {
         const providerId = 'jarvis-local-provider';
         chatApi.registerChatProvider(providerId, {
-            async provideReply(conversation, message, cancellation, progress) {
+            async provideReply(conversation, message, cancellation, progressOrStream) {
                 // message contains text in message.text
                 const text = message?.text || '';
                 if (!text) return { items: [] };
+
+                // Determine if progressOrStream is a stream-like object (newer Chat API)
+                const stream = (progressOrStream && typeof progressOrStream.markdown === 'function') ? progressOrStream : null;
+                const progress = (!stream && progressOrStream && typeof progressOrStream.report === 'function') ? progressOrStream : null;
+
+                // Determine preferred provider from extension configuration
+                const cfg = vscode.workspace.getConfiguration('jarvis');
+                const provider = cfg.get('provider', 'ollama');
+
                 try {
-                    const resp = await fetch(SERVER_URL + '/api/chat', {
+                    const resp = await fetch(SERVER_URL + '/api/chat/stream', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message: text })
+                        body: JSON.stringify({ message: text, provider })
                     });
-                    const data = await resp.json();
-                    const reply = data.reply || '';
-                    // Stream-ish: report progress then return final message
-                    if (progress && typeof progress.report === 'function') {
-                        progress.report({ message: 'JARVIS is thinking...' });
+
+                    if (!resp.ok || !resp.body) {
+                        const data = await resp.json().catch(() => ({}));
+                        const reply = data.reply || `Error: ${resp.status}`;
+                        return { items: [{ kind: 1, detail: 'JARVIS', text: reply, mime: 'text/markdown' }] };
                     }
-                    return {
-                        items: [
-                            {
-                                kind: 1, // reply
-                                detail: 'JARVIS',
-                                text: reply,
-                                mime: 'text/markdown'
+
+                    // Read SSE stream from resp.body
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder('utf-8');
+                    let buffer = '';
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true });
+                        // SSE events split by double newline
+                        let idx;
+                        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+                            const raw = buffer.slice(0, idx);
+                            buffer = buffer.slice(idx + 2);
+                            // parse lines starting with data:
+                            const lines = raw.split('\n').map(l => l.trim());
+                            for (const line of lines) {
+                                if (!line) continue;
+                                if (line.startsWith('data:')) {
+                                    const payloadText = line.slice(5).trim();
+                                    try {
+                                        const payload = JSON.parse(payloadText);
+                                        if (payload.token) {
+                                            const token = payload.token;
+                                            if (stream) {
+                                                try { stream.markdown(token); } catch (e) { if (progress) progress.report({ message: token }); }
+                                            } else if (progress) {
+                                                progress.report({ message: token });
+                                            }
+                                        } else if (payload.done) {
+                                            const final = payload.response || '';
+                                            return { items: [{ kind: 1, detail: 'JARVIS', text: final, mime: 'text/markdown' }] };
+                                        } else if (payload.error) {
+                                            return { items: [{ kind: 1, detail: 'JARVIS', text: 'Error: ' + payload.error, mime: 'text/markdown' }] };
+                                        }
+                                    } catch (err) {
+                                        // ignore JSON parse errors
+                                    }
+                                }
                             }
-                        ]
-                    };
+                        }
+                    }
+
+                    // If stream ended without explicit final chunk, attempt to flush remaining buffer
+                    if (buffer.trim()) {
+                        const lines = buffer.split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('data:')) {
+                                try {
+                                    const payload = JSON.parse(line.slice(5).trim());
+                                    if (payload.response) {
+                                        return { items: [{ kind: 1, detail: 'JARVIS', text: payload.response, mime: 'text/markdown' }] };
+                                    }
+                                } catch (e) {}
+                            }
+                        }
+                    }
+
+                    return { items: [{ kind: 1, detail: 'JARVIS', text: 'No response from JARVIS.', mime: 'text/markdown' }] };
                 } catch (err) {
                     return { items: [{ kind: 1, detail: 'JARVIS', text: 'Error contacting local JARVIS server: ' + String(err), mime: 'text/markdown' }] };
                 }
@@ -116,46 +175,78 @@ class JarvisHudProvider implements vscode.WebviewViewProvider {
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>JARVIS HUD</title>
 <style>
-body { background:#050b16; color:#eee; font-family: sans-serif; padding: 12px }
+body { background:#050b16; color:#eee; font-family: monospace; padding: 12px }
 #status { font-weight:700; margin-bottom:8px }
 canvas { width:100%; height:80px; background: rgba(255,255,255,0.03); border-radius:8px }
 #transcript { margin-top:8px; font-size:14px }
+#proposals { margin-top:12px }
+.proposal { background: rgba(255,255,255,0.02); padding:8px; border-radius:6px; margin-bottom:8px }
+.proposal pre { max-height:120px; overflow:auto; background: rgba(0,0,0,0.4); padding:8px; }
+.button { padding:6px 10px; margin-right:6px; border-radius:6px; cursor:pointer; background:#2b7cff; color:#fff }
+.button.reject { background:#ff6b6b }
 </style>
 </head>
 <body>
 <div id="status">Connecting to JARVIS...</div>
 <canvas id="waveform"></canvas>
 <div id="transcript"></div>
+<h3>Pending Tool Proposals</h3>
+<div id="proposals"></div>
 <script nonce="${nonce}">
 (function(){
-    const status = document.getElementById('status');
-    const transcript = document.getElementById('transcript');
-    const canvas = document.getElementById('waveform');
-    const ctx = canvas.getContext('2d');
-    function resize(){ canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; }
-    window.addEventListener('resize', resize); resize();
+        const status = document.getElementById('status');
+        const transcript = document.getElementById('transcript');
+        const canvas = document.getElementById('waveform');
+        const proposalsEl = document.getElementById('proposals');
+        const ctx = canvas.getContext('2d');
+        function resize(){ canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; }
+        window.addEventListener('resize', resize); resize();
 
-    function drawLevel(level){
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        const w = canvas.width; const h = canvas.height; const val = Math.max(0, Math.min(1, level));
-        ctx.fillStyle='rgba(103,217,255,0.18)';
-        ctx.fillRect(0, h*(1-val), w, h*val);
-    }
+        function drawLevel(level){
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            const w = canvas.width; const h = canvas.height; const val = Math.max(0, Math.min(1, level));
+            ctx.fillStyle='rgba(103,217,255,0.18)';
+            ctx.fillRect(0, h*(1-val), w, h*val);
+        }
 
-    let ws;
-    try{
-        ws = new WebSocket('${WS_URL}');
-        ws.onopen = () => { status.textContent = 'Connected to JARVIS (WS)'; };
-        ws.onmessage = (ev) => {
+        let ws;
+        try{
+            ws = new WebSocket('${WS_URL}');
+            ws.onopen = () => { status.textContent = 'Connected to JARVIS (WS)'; };
+            ws.onmessage = (ev) => {
+                try{
+                    const d = JSON.parse(ev.data);
+                    if(d.type === 'audio_level' && d.payload){ drawLevel(d.payload.rms || 0); }
+                    if(d.type === 'transcript' && d.payload){ transcript.textContent = d.payload.text || ''; }
+                    if(d.type === 'state' && d.payload){ status.textContent = 'State: ' + (d.payload.state || 'unknown'); }
+                    if(d.type === 'pending_tool_proposal' && d.payload){ addProposal(d.payload); }
+                }catch(e){ console.warn(e); }
+            };
+            ws.onclose = () => { status.textContent = 'Disconnected from JARVIS (WS)'; };
+        }catch(e){ status.textContent = 'WS connection failed: ' + e.message; }
+
+        function addProposal(p){
+            const container = document.createElement('div');
+            container.className = 'proposal';
+            const title = document.createElement('div'); title.textContent = `#${p.index}: ${p.spec}`;
+            const pre = document.createElement('pre'); pre.textContent = p.preview || '';
+            const reasons = document.createElement('div'); reasons.textContent = 'Reasons: ' + (p.reasons || []).join(', ');
+            const approve = document.createElement('button'); approve.className='button'; approve.textContent='Approve & Inject';
+            const reject = document.createElement('button'); reject.className='button reject'; reject.textContent='Reject';
+            approve.onclick = () => { actionProposal(p.index, true, container); };
+            reject.onclick = () => { actionProposal(p.index, false, container); };
+            container.appendChild(title); container.appendChild(pre); container.appendChild(reasons); container.appendChild(approve); container.appendChild(reject);
+            proposalsEl.appendChild(container);
+        }
+
+        async function actionProposal(index, confirm, container){
             try{
-                const d = JSON.parse(ev.data);
-                if(d.type === 'audio_level' && d.payload){ drawLevel(d.payload.rms || 0); }
-                if(d.type === 'transcript' && d.payload){ transcript.textContent = d.payload.text || ''; }
-                if(d.type === 'state' && d.payload){ status.textContent = 'State: ' + (d.payload.state || 'unknown'); }
-            }catch(e){ console.warn(e); }
-        };
-        ws.onclose = () => { status.textContent = 'Disconnected from JARVIS (WS)'; };
-    }catch(e){ status.textContent = 'WS connection failed: ' + e.message; }
+                const resp = await fetch('${SERVER_URL}/api/confirm_tool', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({index, confirm}) });
+                const data = await resp.json().catch(()=>({}));
+                if(resp.ok){ container.remove(); }
+                else { alert('Failed: ' + (data.error || JSON.stringify(data))); }
+            }catch(e){ alert('Request failed: ' + e.message); }
+        }
 })();
 </script>
 </body>

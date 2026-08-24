@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, Response
 
 try:
     import ollama
@@ -1487,8 +1487,20 @@ class JarvisAgent:
                             "code": code,
                             "reasons": forbidden_reasons,
                         }
-                        self.memory.setdefault("pending_tool_proposals", []).append(pending)
+                        proposals = self.memory.setdefault("pending_tool_proposals", [])
+                        proposals.append(pending)
+                        index = len(proposals) - 1
                         self.save_state()
+                        # broadcast pending proposal to connected HUD clients
+                        try:
+                            from ws_broadcaster import broadcast_sync
+                            preview = code[:1000]
+                            broadcast_sync({
+                                "type": "pending_tool_proposal",
+                                "payload": {"index": index, "spec": spec, "preview": preview, "reasons": forbidden_reasons}
+                            })
+                        except Exception:
+                            pass
                         return (
                             "Generated code contains potentially dangerous operations and was NOT applied automatically. "
                             "Reasons: " + ", ".join(forbidden_reasons) + ".\nPlease review and confirm explicitly to apply this change."
@@ -1803,6 +1815,44 @@ class JarvisAgent:
                 return jsonify({"text": transcript, "reply": reply, "enabled": self.agent_enabled})
             except Exception as exc:  # pragma: no cover
                 return jsonify({"error": f"Transcription failed: {exc}"}), 400
+
+        @app.route('/api/chat/stream', methods=['POST'])
+        def api_chat_stream():
+            """Server-Sent Events streaming endpoint. Accepts JSON {message: str, provider: optional}
+            Streams tokens as SSE `data: {"token": "..."}\n\n` and ends with a final chunk {"done": true, "response": full, "executed_tools": [...]}.
+            """
+            try:
+                payload = request.get_json(silent=True) or {}
+                message = str(payload.get('message') or payload.get('text') or '')
+                provider = str(payload.get('provider') or '')
+                if not message:
+                    return (jsonify({'error': 'No message provided'}), 400)
+
+                def event_stream():
+                    try:
+                        from agent import LLMRouter
+                        router = LLMRouter(provider or None)
+                        # stream tokens
+                        for chunk in router.stream_query(message, tools=get_all_tools(), system_prompt=self._system_prompt()):
+                            if isinstance(chunk, dict) and chunk.get('__final__'):
+                                final = {'done': True, 'response': chunk.get('response', ''), 'executed_tools': chunk.get('executed_tools', [])}
+                                yield f"data: {json.dumps(final)}\n\n"
+                                break
+                            else:
+                                # chunk is a string
+                                try:
+                                    token = str(chunk)
+                                    yield f"data: {json.dumps({'token': token})}\n\n"
+                                except Exception:
+                                    pass
+                    except Exception as exc:
+                        try:
+                            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                        except Exception:
+                            pass
+                return Response(event_stream(), mimetype='text/event-stream', headers={"Cache-Control": "no-cache"})
+            except Exception as exc:
+                return jsonify({"error": str(exc)}), 500
 
         @app.route("/api/stop_speech", methods=["POST"])
         def api_stop_speech():
