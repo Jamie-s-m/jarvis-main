@@ -15,6 +15,8 @@ It is designed to feel like a personal assistant that can:
 
 Important: for the most stable microphone support, use Python 3.12 or 3.11. PyAudio is much more reliable there than on Python 3.14.
 
+### Install the project
+
 1. Open PowerShell in the project folder.
 2. Run the installer:
 
@@ -22,19 +24,41 @@ Important: for the most stable microphone support, use Python 3.12 or 3.11. PyAu
 powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
 ```
 
-3. Start the app:
+This creates a local `.venv`, installs dependencies, and writes a ready-to-edit `.env` file.
+
+### Run the desktop app in development mode
 
 ```powershell
 .\start_jarvis.bat
 ```
 
-4. Open the browser at:
+This starts the desktop launcher, opens the JARVIS interface in your browser, and keeps the app available at:
 
 ```text
 http://127.0.0.1:5000
 ```
 
-5. Use the UI or talk to the assistant by voice after the wake phrase.
+### Build the Windows desktop executable
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_windows_exe.ps1
+```
+
+This creates a packaged Windows executable in the `dist` folder:
+
+```text
+dist\JarvisAgent.exe
+```
+
+### Build an installer package (optional)
+
+If you have Inno Setup installed, you can build a real Windows installer from the included script:
+
+```powershell
+ISCC.exe .\JarvisAgent.iss
+```
+
+This generates a Windows setup file for installing JARVIS on another machine.
 
 ## Features
 
@@ -164,3 +188,41 @@ The project is ready for local desktop use and for further extension. It already
 ## Support and next steps
 
 For deeper improvements, see [DEVELOPMENT.md](./DEVELOPMENT.md).
+
+---
+
+## Electron native wrapper (new)
+
+An Electron-based native wrapper has been added to provide a standalone cinematic desktop app experience. Files added:
+- [package.json](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/package.json)
+- [main.js](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/main.js)
+- [preload.js](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/preload.js)
+- [start_electron.bat](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/start_electron.bat)
+
+What it does:
+- Launches the Python desktop server (jarvis_desktop.py) automatically (prefers .venv\Scripts\python.exe when present)
+- Opens a frameless BrowserWindow that loads the HUD at http://127.0.0.1:5000
+- Ensures single-instance behavior and tries to terminate the server when the Electron app quits
+
+Development run (quick):
+1. Ensure Python venv and dependencies are installed (use install_windows.ps1)
+2. Install Node + npm
+3. In project root run:
+   npm install
+   npm start
+
+Packaging notes:
+- electron-builder configuration is included in package.json. To produce a Windows installer (NSIS):
+  1. npm install --save-dev electron electron-builder
+  2. npx electron-builder --win --x64
+- Recommended production flow: create a PyInstaller-built dist\JarvisAgent.exe and modify main.js to spawn that executable (safer for end users who don't want to manage Python).
+
+Next recommended steps (can implement on request):
+- Switch main.js to detect and spawn dist\JarvisAgent.exe if present (recommended for final installer builds).
+- Implement WebSocket push + waveform streaming so the native window shows real-time mic levels and interim ASR transcripts (this is the next priority to make the HUD live).
+- Add tray, media keys, and global hotkeys for wake/stop behaviors.
+
+If you'd like me to continue, confirm whether to:
+- Use dist\\JarvisAgent.exe as the canonical backend to spawn from Electron (recommended), and
+- Implement WebSocket push + waveform streaming next so the native app has live feedback.
+

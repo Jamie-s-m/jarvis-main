@@ -46,6 +46,12 @@ if (-not (Test-Path ".env")) {
 OLLAMA_MODEL=llama3.1
 STT_LANGUAGE=en-US
 WAKE_WORD=jarvis
+WAKE_PHRASES=jarvis,hi jarvis,hey jarvis,hello jarvis
+WAKE_CLAP_ENABLED=true
+TTS_PROVIDER=pyttsx3
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE=Rachel
+ELEVENLABS_MODEL=eleven_turbo_v2
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 OPENROUTER_API_KEY=
@@ -57,7 +63,9 @@ PORT=5000
 }
 
 Write-Host "Setup complete."
-Write-Host "Run the assistant with:"
-Write-Host "  .\.venv\Scripts\python.exe jarvis.py"
-Write-Host "Or use:"
+Write-Host "Run the assistant desktop app with:"
+Write-Host "  .\.venv\Scripts\python.exe jarvis_desktop.py"
+Write-Host "Or use the batch launcher:"
 Write-Host "  start_jarvis.bat"
+Write-Host "To build a Windows EXE, run:"
+Write-Host "  powershell -ExecutionPolicy Bypass -File .\build_windows_exe.ps1"

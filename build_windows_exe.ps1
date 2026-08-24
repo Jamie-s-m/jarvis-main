@@ -9,6 +9,19 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 }
 
 $python = Join-Path $root ".venv\Scripts\python.exe"
-& $python -m PyInstaller --noconsole --onefile --collect-all pvporcupine --name JarvisAgent jarvis.py
+if (Test-Path (Join-Path $root "dist\JarvisAgent.exe")) {
+    Remove-Item (Join-Path $root "dist\JarvisAgent.exe") -Force
+}
+if (Test-Path (Join-Path $root "build\JarvisAgent")) {
+    Remove-Item (Join-Path $root "build\JarvisAgent") -Recurse -Force
+}
+Write-Host "Building the Windows desktop launcher..."
+& $python -m PyInstaller --noconsole --onefile --windowed --collect-all pvporcupine --collect-all sounddevice --collect-all psutil --name JarvisAgent jarvis_desktop.py
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Jarvis desktop build failed."
+}
+
 Write-Host "Build complete. Check the dist\ folder."
-Write-Host "If wake-word detection is required, ensure PORCUPINE_ACCESS_KEY and the keyword model are configured before running the executable."
+Write-Host "Run the generated executable to open the JARVIS desktop interface in the browser."
+Write-Host "For real wake-word support, configure PORCUPINE_ACCESS_KEY and a valid Porcupine keyword model."

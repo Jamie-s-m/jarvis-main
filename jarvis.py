@@ -68,7 +68,23 @@ MEMORY_DB = BASE_DIR / "jarvis_memory.sqlite3"
 CUSTOM_TOOLS_FILE = BASE_DIR / "custom_tools.py"
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 WAKE_WORD = os.getenv("WAKE_WORD", "jarvis").lower()
+WAKE_PHRASES = [
+    phrase.strip().lower()
+    for phrase in os.getenv("WAKE_PHRASES", f"{WAKE_WORD},hi {WAKE_WORD},hey {WAKE_WORD},hello {WAKE_WORD}").split(",")
+    if phrase.strip()
+]
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en-US")
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "pyttsx3").lower()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE = os.getenv("ELEVENLABS_VOICE", "").strip()
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2").strip()
+# Prefer ElevenLabs when an API key is present unless explicitly overridden
+if ELEVENLABS_API_KEY and (not TTS_PROVIDER or TTS_PROVIDER == "pyttsx3"):
+    TTS_PROVIDER = "elevenlabs"
+    # If no voice specified, attempt to pick a likely male voice at runtime (best-effort)
+    if not ELEVENLABS_VOICE:
+        ELEVENLABS_VOICE = ""
+WAKE_CLAP_ENABLED = os.getenv("WAKE_CLAP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,7 +168,16 @@ def save_memory(memory_data: Dict[str, Any]) -> None:
         connection.commit()
         connection.close()
 
-        MEMORY_FILE.write_text(json.dumps(memory_data, indent=2), encoding="utf-8")
+        # Atomic write to memory file to avoid corruption on crashes
+        try:
+            tmp_path = MEMORY_FILE.with_suffix('.tmp.json')
+            tmp_path.write_text(json.dumps(memory_data, indent=2), encoding="utf-8")
+            os.replace(str(tmp_path), str(MEMORY_FILE))
+        except Exception:
+            try:
+                MEMORY_FILE.write_text(json.dumps(memory_data, indent=2), encoding="utf-8")
+            except Exception as exc:
+                log.error("Failed to persist memory file: %s", exc)
     except Exception as exc:  # pragma: no cover
         log.error("Failed to save memory: %s", exc)
 
@@ -206,7 +231,12 @@ class SemanticMemoryStore:
         query_vec = self._embed_text(query, vocab)
         scored: List[tuple[float, str]] = []
         for text, embedding_json in rows:
-            vec = np.asarray(json.loads(embedding_json), dtype=float)
+            try:
+                vec = np.asarray(json.loads(embedding_json), dtype=float)
+            except Exception:
+                vec = np.asarray([], dtype=float)
+            if vec.size != len(vocab):
+                vec = self._embed_text(text, vocab)
             if vec.size == 0:
                 continue
             similarity = float(np.dot(query_vec, vec))
@@ -457,14 +487,31 @@ def write_file(file_path: str, content: str) -> str:
 
 
 def open_in_vscode(target_path: str = ".") -> str:
-    """Open a folder or file in VS Code if the CLI is installed on the system."""
+    """Open a folder or file in VS Code using the CLI or a common Windows installation path."""
     path = Path(target_path).expanduser().resolve() if target_path and target_path.strip() else Path.cwd()
-    candidates = ["code", "code.cmd", "code-insiders", "code-insiders.cmd"]
+    candidates = ["code", "code.cmd", "code-insiders", "code-insiders.cmd", "codium", "codium.cmd", "cursor", "cursor.cmd"]
     cli = next((name for name in candidates if shutil.which(name)), None)
+
     if not cli:
-        return "VS Code CLI is not installed or not on PATH. Install the 'code' command to open a workspace from here."
+        windows_candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code Insiders" / "Code - Insiders.exe",
+            Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft VS Code" / "Code.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft VS Code" / "Code.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Cursor" / "Cursor.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "VSCodium" / "VSCodium.exe",
+        ]
+        exe_path = next((candidate for candidate in windows_candidates if candidate.exists()), None)
+        if exe_path:
+            try:
+                subprocess.Popen([str(exe_path), str(path)], shell=False)
+                return f"Opened '{path}' in VS Code."
+            except Exception as exc:  # pragma: no cover
+                return f"Failed to open VS Code via executable path: {exc}"
+        return "VS Code CLI is not installed or not on PATH. Install the 'code' command or open VS Code manually, then retry."
+
     try:
-        subprocess.run([cli, str(path)], check=True, capture_output=True, text=True)
+        subprocess.Popen([cli, str(path)], shell=False)
         return f"Opened '{path}' in VS Code."
     except Exception as exc:  # pragma: no cover
         return f"Failed to open VS Code: {exc}"
@@ -731,11 +778,13 @@ class WakeWordDetector:
         self._initialized = False
 
     @staticmethod
+    @staticmethod
     def phrase_matches(text: str) -> bool:
         cleaned = (text or "").lower()
         if not cleaned:
             return False
-        wake_tokens = [WAKE_WORD, f"hi {WAKE_WORD}", f"hey {WAKE_WORD}", f"hello {WAKE_WORD}", f"{WAKE_WORD} please"]
+        wake_tokens = set(WAKE_PHRASES)
+        wake_tokens.update({WAKE_WORD, f"hi {WAKE_WORD}", f"hey {WAKE_WORD}", f"hello {WAKE_WORD}", f"{WAKE_WORD} please"})
         return any(token in cleaned for token in wake_tokens)
 
     @staticmethod
@@ -743,11 +792,17 @@ class WakeWordDetector:
         if audio_buffer is None or audio_buffer.size == 0:
             return False
         amplitude = np.abs(audio_buffer.astype(float))
+        if amplitude.size == 0:
+            return False
         energy = np.mean(amplitude)
-        peaks = np.where(amplitude > max(energy * threshold, np.percentile(amplitude, 85)))[0]
+        clap_floor = max(energy * threshold, float(np.percentile(amplitude, 85)))
+        peaks = np.where(amplitude > clap_floor)[0]
         if len(peaks) < 2:
             return False
-        return bool(np.diff(peaks).min() > 10)
+        gaps = np.diff(peaks)
+        if gaps.size == 0:
+            return False
+        return bool(np.any(gaps > 10) and np.sum(gaps > 10) >= 2)
 
     def is_available(self) -> bool:
         return pvporcupine is not None and bool(self.access_key)
@@ -806,6 +861,181 @@ class MultiAgentOrchestrator:
         if result is None:
             return "I am ready to assist, sir."
         return self.reviewer.review(query, result)
+
+
+class VoiceEngine:
+    """Configurable voice output layer with local and cloud TTS support.
+
+    Implementation notes:
+    - Prefer ElevenLabs if an API key is present.
+    - Use simpleaudio playback for interruptible audio when ElevenLabs returns raw bytes.
+    - Fall back to pyttsx3 if ElevenLabs is not available or fails.
+    - Provide a stop() method to perform thread-safe barge-in handling.
+    """
+
+    _playback_lock = threading.RLock()
+    _play_obj = None
+    _is_playing = False
+
+    @staticmethod
+    def stop() -> None:
+        """Stop any active playback (safe to call from other threads)."""
+        with VoiceEngine._playback_lock:
+            VoiceEngine._is_playing = False
+            try:
+                if VoiceEngine._play_obj is not None:
+                    try:
+                        VoiceEngine._play_obj.stop()
+                    except Exception:
+                        pass
+                    VoiceEngine._play_obj = None
+            except Exception:
+                pass
+
+    @staticmethod
+    def _play_bytes(audio_bytes: bytes, sample_rate: int = 22050, num_channels: int = 1, bytes_per_sample: int = 2):
+        try:
+            import simpleaudio as sa
+        except Exception:
+            sa = None
+        if sa is None:
+            # as a last resort, write to temp file and try platform default player
+            try:
+                from tempfile import NamedTemporaryFile
+                with NamedTemporaryFile(suffix='.wav', delete=True) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp.flush()
+                    # platform dependent non-blocking player could be used; fall back to blocking play via requests if available
+                    if sys.platform == 'win32':
+                        import subprocess
+                        subprocess.call(['powershell', '-c', f'Start-Process -FilePath "{tmp.name}" -NoNewWindow'])
+                    else:
+                        subprocess.call(['xdg-open', tmp.name])
+                return None
+            except Exception:
+                return None
+
+        # simpleaudio expects raw PCM; many TTS SDKs return WAV or mp3 bytes. We attempt to play WAV by using sa.WaveObject.from_wave_file-like API.
+        try:
+            # try loading via sa.WaveObject
+            wave_obj = sa.WaveObject(audio_bytes, num_channels, bytes_per_sample, sample_rate)
+            play_obj = wave_obj.play()
+            with VoiceEngine._playback_lock:
+                VoiceEngine._play_obj = play_obj
+                VoiceEngine._is_playing = True
+            # wait while monitoring stop flag
+            while play_obj.is_playing() and VoiceEngine._is_playing:
+                time.sleep(0.05)
+            if play_obj.is_playing() and not VoiceEngine._is_playing:
+                try:
+                    play_obj.stop()
+                except Exception:
+                    pass
+            with VoiceEngine._playback_lock:
+                VoiceEngine._play_obj = None
+                VoiceEngine._is_playing = False
+            return None
+        except Exception:
+            # fallback: attempt sa.play_buffer with decoded PCM - best-effort not implemented here
+            try:
+                play_obj = sa.play_buffer(audio_bytes, num_channels, bytes_per_sample, sample_rate)
+                with VoiceEngine._playback_lock:
+                    VoiceEngine._play_obj = play_obj
+                    VoiceEngine._is_playing = True
+                while play_obj.is_playing() and VoiceEngine._is_playing:
+                    time.sleep(0.05)
+                if play_obj.is_playing() and not VoiceEngine._is_playing:
+                    try:
+                        play_obj.stop()
+                    except Exception:
+                        pass
+                with VoiceEngine._playback_lock:
+                    VoiceEngine._play_obj = None
+                    VoiceEngine._is_playing = False
+            except Exception:
+                with VoiceEngine._playback_lock:
+                    VoiceEngine._play_obj = None
+                    VoiceEngine._is_playing = False
+            return None
+
+    @staticmethod
+    def speak(text: str) -> bool:
+        if not text or not text.strip():
+            return False
+        provider = TTS_PROVIDER
+        # Ensure any previous playback is stopped before starting new
+        VoiceEngine.stop()
+
+        if provider == "elevenlabs" and ELEVENLABS_API_KEY:
+            try:
+                # use the SDK to generate raw audio bytes (prefer a WAV/PCM return)
+                try:
+                    from elevenlabs import generate
+                    # SDK generate(..., stream=True) may or may not be available; use generate to get audio bytes
+                    audio = generate(text=text, voice=ELEVENLABS_VOICE or ELEVENLABS_MODEL, model=ELEVENLABS_MODEL)
+                    # audio may be an object or raw bytes; coerce to bytes
+                    if hasattr(audio, 'read'):
+                        audio_bytes = audio.read()
+                    elif isinstance(audio, (bytes, bytearray)):
+                        audio_bytes = bytes(audio)
+                    else:
+                        # attempt to convert to bytes via str
+                        audio_bytes = str(audio).encode('utf-8')
+                except Exception:
+                    # fallback: call REST endpoint directly to request wav stream
+                    import requests
+                    url = 'https://api.elevenlabs.io/v1/text-to-speech/' + (ELEVENLABS_VOICE or ELEVENLABS_MODEL)
+                    headers = {'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json'}
+                    body = {'text': text, 'model': ELEVENLABS_MODEL}
+                    resp = requests.post(url, json=body, headers=headers, timeout=10)
+                    resp.raise_for_status()
+                    audio_bytes = resp.content
+
+                # play audio in a dedicated thread so the calling thread isn't blocked
+                def _play_thread(bts: bytes):
+                    try:
+                        VoiceEngine._play_bytes(bts)
+                    except Exception:
+                        pass
+
+                t = threading.Thread(target=_play_thread, args=(audio_bytes,), daemon=True)
+                t.start()
+                return True
+            except Exception as exc:  # pragma: no cover
+                log.warning("ElevenLabs voice output failed: %s", exc)
+        # Fallback to pyttsx3 local TTS
+        if pyttsx3 is not None:
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty("rate", 170)
+                engine.setProperty("volume", 1.0)
+                voices = engine.getProperty("voices")
+                for voice in voices:
+                    v_name = getattr(voice, "name", "").lower()
+                    if any(token in v_name for token in ["david", "mark", "george", "male", "voice"]):
+                        engine.setProperty("voice", voice.id)
+                        break
+                # run pyttsx3 in its own thread so we can stop it via engine.stop()
+                def _pytt_thread(txt: str):
+                    try:
+                        engine.say(txt)
+                        engine.runAndWait()
+                    except Exception:
+                        try:
+                            engine.stop()
+                        except Exception:
+                            pass
+
+                t = threading.Thread(target=_pytt_thread, args=(text,), daemon=True)
+                t.start()
+                return True
+            except Exception as exc:  # pragma: no cover
+                log.warning("pyttsx3 voice output failed: %s", exc)
+        log.info("Speech output is unavailable because no TTS backend is configured.")
+        return False
+                log.warning("pyttsx3 voice output failed: %s", exc)
+        log.info("Speech output is unavailable because no TTS backend is configured.")
+        return False
 
 
 class CommandIntentEngine:
@@ -956,7 +1186,15 @@ class JarvisAgent:
     def set_enabled(self, enabled: bool) -> Dict[str, Any]:
         self.agent_enabled = bool(enabled)
         self.save_state()
-        return {"enabled": self.agent_enabled, "status": "active" if self.agent_enabled else "sleeping"}
+        state = {"enabled": self.agent_enabled, "status": "active" if self.agent_enabled else "sleeping"}
+        # Broadcast new state to any connected UI clients (websocket)
+        try:
+            from ws_broadcaster import broadcast_sync
+
+            broadcast_sync({"type": "state", "payload": state})
+        except Exception:
+            pass
+        return state
 
     def turn_on(self) -> Dict[str, Any]:
         return self.set_enabled(True)
@@ -968,11 +1206,16 @@ class JarvisAgent:
     def stop_speech(self) -> None:
         self.speech_stop_event.set()
         self.is_speaking = False
+        try:
+            # stop any active VoiceEngine playback
+            VoiceEngine.stop()
+        except Exception:
+            pass
 
     def speak(self, text: str) -> None:
         if not text or not text.strip():
             return
-        if pyttsx3 is None:
+        if pyttsx3 is None and not (TTS_PROVIDER == "elevenlabs" and ELEVENLABS_API_KEY):
             log.info("Speech disabled; TTS backend is not available.")
             return
 
@@ -980,21 +1223,8 @@ class JarvisAgent:
             self.speech_stop_event.clear()
             self.is_speaking = True
             try:
-                engine = pyttsx3.init()
-                engine.setProperty("rate", 170)
-                engine.setProperty("volume", 1.0)
-                voices = engine.getProperty("voices")
-                for voice in voices:
-                    v_name = getattr(voice, "name", "").lower()
-                    if any(token in v_name for token in ["david", "mark", "george", "male", "voice"]):
-                        engine.setProperty("voice", voice.id)
-                        break
-                for sentence in re.split(r"(?<=[.!?])\s+", text):
-                    if self.speech_stop_event.is_set():
-                        break
-                    if sentence.strip():
-                        engine.say(sentence)
-                        engine.runAndWait()
+                if not VoiceEngine.speak(text):
+                    log.info("Speech output requested but no voice backend was available.")
             except Exception as exc:  # pragma: no cover
                 log.error("TTS error: %s", exc)
             finally:
@@ -1029,13 +1259,16 @@ class JarvisAgent:
 
     def _system_prompt(self) -> str:
         profile = self.memory.get("user_profile", "User prefers brief, formal, direct, and highly capable assistance in a true JARVIS style.")
-        relevant_memories = self.semantic_memory.retrieve(self.memory.get("history", [])[-1].get("content", "") if self.memory.get("history") else "", 3)
+        recent_query = self.memory.get("history", [])[-1].get("content", "") if self.memory.get("history") else ""
+        relevant_memories = self.semantic_memory.retrieve(recent_query, 3)
         memory_text = "\n".join(f"- {item}" for item in relevant_memories) if relevant_memories else "- No relevant long-term memory available."
+        recent_summary = self.memory.get("preferences", {}).get("voice", "default")
         return (
             "You are JARVIS, an advanced desktop AI assistant. "
             f"Behavior: {profile}. "
+            f"Voice profile: {recent_summary}. "
             "Respond in brief, formal, polished English. "
-            "Always think before responding: identify the user's intent, resolve direct commands efficiently, and keep the answer short and professional. "
+            "Always think before responding: identify the user's intent, resolve direct commands efficiently, keep the answer short and professional, and report completion after actions. "
             "If the user is chatting casually, respond as a capable assistant with calm, brief, formal conversation. "
             "Use tools when relevant for system operations, web tasks, coding, file tasks, and command execution. "
             f"Relevant long-term memory:\n{memory_text}"
@@ -1161,13 +1394,29 @@ class JarvisAgent:
             return "Action completed successfully, sir."
         if text.lower().startswith("action completed"):
             return text
+        if len(text) > 220:
+            summary = re.sub(r"\s+", " ", text)
+            return f"Action completed. {summary[:200]}"
         return f"Action completed. {text}"
+
+    def _remember_recent_context(self, query: str) -> None:
+        cleaned = (query or "").strip()
+        if not cleaned:
+            return
+        self.semantic_memory.add_fact(cleaned, "user")
+        self.memory.setdefault("self_improvement_log", []).append({
+            "timestamp": time.time(),
+            "fact": cleaned,
+            "importance": 1.5,
+        })
 
     def process_user_query(self, query: str) -> str:
         self.stop_speech()
         q = (query or "").strip()
         if not q:
             return "I did not receive a valid message."
+
+        self._remember_recent_context(q)
 
         plan = self.orchestrator.plan(q)
         if plan.get("stage") == "execution":
@@ -1192,36 +1441,129 @@ class JarvisAgent:
         if sr is None:
             log.warning("Voice input is disabled because SpeechRecognition is not installed.")
             return
+        has_pyaudio = True
         try:
             import pyaudio  # noqa: F401
         except Exception as exc:  # pragma: no cover
-            log.warning("Voice input is disabled: PyAudio is missing. Install it with 'pip install pyaudio' or 'pipwin install pyaudio'. Details: %s", exc)
+            log.warning("PyAudio not available: %s", exc)
+            has_pyaudio = False
+
+        use_sounddevice = sd is not None
+        if not has_pyaudio and not use_sounddevice:
+            log.warning("Voice input is disabled: no audio capture backend available (PyAudio or sounddevice required).")
             return
 
-        try:
-            recognizer = sr.Recognizer()
-            recognizer.dynamic_energy_threshold = True
-            recognizer.pause_threshold = 0.6
-            microphone = sr.Microphone()
-        except (AttributeError, OSError, ValueError) as exc:
-            log.warning("Microphone initialization failed: %s", exc)
-            return
+        recognizer = sr.Recognizer()
+        recognizer.dynamic_energy_threshold = True
+        recognizer.pause_threshold = 0.6
+
+        microphone = None
+        if has_pyaudio:
+            try:
+                microphone = sr.Microphone()
+            except (AttributeError, OSError, ValueError) as exc:
+                log.warning("Microphone initialization failed: %s", exc)
+                microphone = None
 
         self.listener_stop_event.clear()
 
-        while not self.listener_stop_event.is_set():
-            if not self.agent_enabled:
-                time.sleep(0.25)
-                continue
+        def record_with_sounddevice(duration: float = 3.0, sample_rate: int = 16000):
             try:
-                with microphone as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.25)
-                    audio = recognizer.listen(source, timeout=2, phrase_time_limit=5)
-                text = recognizer.recognize_google(audio, language=STT_LANGUAGE)
+                recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+                sd.wait()
+                data = np.asarray(recording).flatten()
+                raw_bytes = data.tobytes()
+                audio_data = sr.AudioData(raw_bytes, sample_rate, 2)
+                return audio_data
+            except Exception as exc:
+                log.warning("sounddevice capture failed: %s", exc)
+                return None
+
+        while not self.listener_stop_event.is_set():
+            # handle inbound WS client controls (stop speaking, toggle listening)
+            try:
+                from ws_broadcaster import pop_control
+            except Exception:
+                pop_control = None
+
+            try:
+                if pop_control is not None:
+                    ctrl = pop_control()
+                    if ctrl and isinstance(ctrl, dict):
+                        action = ctrl.get('action')
+                        if action == 'stop_speaking':
+                            self.stop_speech()
+                        elif action == 'toggle_listening':
+                            self.set_enabled(not self.agent_enabled)
+                if not self.agent_enabled:
+                    time.sleep(0.25)
+                    continue
+            except Exception:
+                # fall through to normal listening
+                pass
+
+            try:
+                audio = None
+                if microphone is not None:
+                    with microphone as source:
+                        recognizer.adjust_for_ambient_noise(source, duration=0.25)
+                        audio = recognizer.listen(source, timeout=2, phrase_time_limit=5)
+                else:
+                    audio = record_with_sounddevice(duration=3.0, sample_rate=16000)
+
+                if audio is None:
+                    continue
+
+                raw_audio = None
+                try:
+                    raw_audio = np.frombuffer(audio.get_raw_data(), dtype=np.int16)
+                except Exception:
+                    try:
+                        raw_audio = np.frombuffer(audio.get_raw_data(convert_rate=16000, convert_width=2), dtype=np.int16)
+                    except Exception:
+                        raw_audio = None
+
+                # compute and broadcast simple audio level metrics (RMS / peak)
+                try:
+                    if raw_audio is not None:
+                        arr = raw_audio.astype(float)
+                        rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
+                        peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+                        # normalize to 0..1 by int16 range
+                        norm_rms = min(1.0, rms / 32768.0)
+                        norm_peak = min(1.0, peak / 32768.0)
+                        try:
+                            from ws_broadcaster import broadcast_sync
+
+                            broadcast_sync({"type": "audio_level", "payload": {"rms": norm_rms, "peak": norm_peak}})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                if raw_audio is not None and WAKE_CLAP_ENABLED and self.wake_detector.detect_double_clap(raw_audio):
+                    self.speak("At your service.")
+                    self.process_user_query("What can you do?")
+                    continue
+
+                try:
+                    text = recognizer.recognize_google(audio, language=STT_LANGUAGE)
+                except Exception as exc:
+                    # fallback: skip unrecognized segments silently
+                    continue
+
                 normalized = text.strip()
                 lowered = normalized.lower()
                 if not normalized:
                     continue
+
+                # broadcast the recognized transcript (final result)
+                try:
+                    from ws_broadcaster import broadcast_sync
+
+                    broadcast_sync({"type": "transcript", "payload": {"text": normalized}})
+                except Exception:
+                    pass
 
                 if self.wake_detector.is_available():
                     self.wake_detector.listen()
@@ -1282,8 +1624,9 @@ class JarvisAgent:
         @app.route("/api/open-vscode", methods=["POST"])
         def api_open_vscode():
             payload = request.get_json(silent=True) or {}
-            target = str(payload.get("path") or ".")
-            return jsonify({"result": open_in_vscode(target)})
+            target = str(payload.get("path") or str(BASE_DIR))
+            result = open_in_vscode(target)
+            return jsonify({"result": result, "path": str(Path(target).resolve() if target and target != "." else BASE_DIR)})
 
         @app.route("/api/chat", methods=["POST"])
         def api_chat():
@@ -1316,6 +1659,14 @@ class JarvisAgent:
             except Exception as exc:  # pragma: no cover
                 return jsonify({"error": f"Transcription failed: {exc}"}), 400
 
+        @app.route("/api/stop_speech", methods=["POST"])
+        def api_stop_speech():
+            try:
+                self.stop_speech()
+                return jsonify({"stopped": True})
+            except Exception as exc:
+                return jsonify({"stopped": False, "error": str(exc)}), 500
+
         @app.route("/api/history")
         def api_history():
             return jsonify({"history": self.memory.get("history", [])})
@@ -1329,47 +1680,501 @@ UI_HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Jarvis Agent</title>
+  <title>JARVIS | AI Agent</title>
   <style>
-    body { margin: 0; font-family: Arial, sans-serif; background: #0b1020; color: #edf3ff; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-    .card { width: min(900px, 92vw); background: rgba(22,30,49,0.96); border-radius: 18px; padding: 24px; box-shadow: 0 18px 45px rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.08); }
-    .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .badge { padding: 8px 14px; border-radius: 999px; font-weight: bold; background: rgba(76, 144, 255, 0.2); }
-    .controls { display: flex; gap: 10px; flex-wrap: wrap; }
-    button { border: none; border-radius: 10px; padding: 10px 14px; background: #4a78ff; color: white; cursor: pointer; font-weight: 600; }
-    button.secondary { background: #2c3b5e; }
-    button.ghost { background: rgba(255,255,255,0.08); color: #edf3ff; }
-    .messages { min-height: 300px; max-height: 460px; overflow: auto; padding: 14px; border-radius: 12px; background: rgba(10,15,27,0.8); border: 1px solid rgba(255,255,255,0.06); }
-    .msg { margin: 10px 0; padding: 10px 12px; border-radius: 10px; }
-    .user { background: rgba(90,123,255,0.18); margin-left: 25%; }
-    .assistant { background: rgba(43,196,120,0.14); margin-right: 25%; }
-    form { display: flex; gap: 12px; margin-top: 16px; }
-    input[type=text] { flex: 1; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; background: rgba(2,6,19,0.75); color: #f5f7ff; padding: 12px 14px; font-size: 16px; }
-    @media (max-width: 640px) { .card { padding: 16px; } .topbar { flex-direction: column; align-items: flex-start; } }
+    :root {
+      --bg: #050b16;
+      --bg-soft: rgba(14, 24, 38, 0.9);
+      --panel: rgba(10, 17, 30, 0.9);
+      --panel-strong: rgba(18, 27, 44, 0.98);
+      --cyan: #67d9ff;
+      --cyan-soft: rgba(103, 217, 255, 0.18);
+      --blue: #6c8dff;
+      --green: #8ef0d2;
+      --text: #ebf5ff;
+      --muted: #9bb7d0;
+      --line: rgba(255,255,255,0.08);
+      --danger: #ff7c8f;
+      --shadow: 0 0 25px rgba(103, 217, 255, 0.28);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(circle at top, rgba(81, 131, 255, 0.22), transparent 25%),
+        radial-gradient(circle at bottom right, rgba(103, 217, 255, 0.18), transparent 30%),
+        linear-gradient(135deg, #030811 0%, #071320 40%, #040b12 100%);
+      color: var(--text);
+      font-family: 'Segoe UI', Arial, sans-serif;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 28px;
+    }
+
+    .jarvis-shell {
+      width: min(1250px, 96vw);
+      background: rgba(6, 12, 22, 0.84);
+      border: 1px solid var(--line);
+      border-radius: 26px;
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.58), 0 0 60px rgba(103, 217, 255, 0.12);
+      backdrop-filter: blur(22px);
+      overflow: hidden;
+    }
+
+    .hud-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(12, 20, 35, 0.8);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .brand-mark {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--green), var(--cyan));
+      box-shadow: 0 0 16px rgba(142, 240, 210, 0.7);
+    }
+
+    .security-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 14px var(--green);
+      margin-left: 8px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(103, 217, 255, 0.08);
+      border: 1px solid var(--cyan-soft);
+      padding: 8px 12px;
+      border-radius: 999px;
+      color: var(--text);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 10px 16px;
+      background: linear-gradient(180deg, rgba(103, 217, 255, 0.18), rgba(64, 88, 180, 0.14));
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: var(--shadow);
+      border-color: rgba(103, 217, 255, 0.6);
+    }
+
+    button.secondary {
+      background: rgba(255,255,255,0.04);
+    }
+
+    button.ghost {
+      background: rgba(108, 141, 255, 0.08);
+    }
+
+    .dashboard {
+      display: grid;
+      grid-template-columns: 1.6fr 0.8fr;
+      gap: 18px;
+      padding: 20px;
+    }
+
+    .agent-panel,
+    .side-panel {
+      background: rgba(11, 20, 33, 0.82);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      overflow: hidden;
+    }
+
+    .agent-panel {
+      position: relative;
+      min-height: 430px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      background:
+        linear-gradient(180deg, rgba(14, 22, 35, 0.72), rgba(7, 12, 20, 0.96)),
+        radial-gradient(circle at top, rgba(103, 217, 255, 0.12), transparent 30%);
+    }
+
+    .scanlines {
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        to bottom,
+        rgba(255,255,255,0.03),
+        rgba(255,255,255,0.03) 2px,
+        transparent 2px,
+        transparent 4px
+      );
+      pointer-events: none;
+      opacity: 0.5;
+    }
+
+    .agent-visual {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 280px;
+      overflow: hidden;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .orb {
+      position: relative;
+      width: min(28vw, 260px);
+      height: min(28vw, 260px);
+      border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.75), rgba(103, 217, 255, 0.18) 18%, rgba(103, 217, 255, 0.1) 30%, rgba(14, 18, 28, 0.36) 70%);
+      border: 1px solid rgba(103, 217, 255, 0.55);
+      box-shadow: inset 0 0 28px rgba(103, 217, 255, 0.38), 0 0 30px rgba(103, 217, 255, 0.22);
+      animation: pulseOrb 3.2s infinite ease-in-out;
+          transition: box-shadow 0.2s ease, transform 0.2s ease, filter 0.2s ease;
+        }
+
+        @keyframes pulseOrb {
+          0%, 100% { transform: scale(1); box-shadow: inset 0 0 28px rgba(103, 217, 255, 0.38), 0 0 30px rgba(103, 217, 255, 0.2); }
+          50% { transform: scale(1.04); box-shadow: inset 0 0 38px rgba(103, 217, 255, 0.5), 0 0 45px rgba(103, 217, 255, 0.35); }
+        }
+
+        .orb::before, .orb::after {
+          content: "";
+          position: absolute;
+          inset: 18%;
+          border-radius: 50%;
+          border: 1px solid rgba(103, 217, 255, 0.35);
+        }
+
+        .orb::after {
+          inset: 32%;
+          border-color: rgba(179, 232, 255, 0.42);
+        }
+
+        .orb.listening {
+          transform: scale(1.06);
+          box-shadow: inset 0 0 48px rgba(103, 217, 255, 0.6), 0 0 80px rgba(103, 217, 255, 0.45);
+          filter: drop-shadow(0 0 24px rgba(103,217,255,0.4));
+        }
+
+    .agent-caption {
+      position: absolute;
+      bottom: 20px;
+      left: 22px;
+      right: 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      z-index: 1;
+    }
+
+    .eyebrow {
+      font-size: 11px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .caption-title {
+      font-size: clamp(28px, 3vw, 44px);
+      font-weight: 800;
+      letter-spacing: 0.12em;
+    }
+
+    .caption-sub {
+      color: var(--muted);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      font-size: 11px;
+      margin-top: 8px;
+    }
+
+    .system-readout {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 18px 22px 22px;
+      z-index: 1;
+    }
+
+    .readout-box {
+      flex: 1;
+      min-width: 130px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 12px 14px;
+    }
+
+    .readout-label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .readout-value {
+      font-size: 22px;
+      font-weight: 700;
+      font-family: 'Segoe UI Semibold', Arial, sans-serif;
+    }
+
+    .side-panel {
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .side-card {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+    }
+
+    .side-card h3 {
+      margin: 0 0 12px 0;
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .metric-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      color: var(--muted);
+    }
+
+    .metric-row:last-child { border-bottom: none; }
+
+    .metric-row strong {
+      color: var(--text);
+      font-weight: 700;
+    }
+
+    .command-panel {
+      margin-top: 18px;
+      border-top: 1px solid var(--line);
+      padding-top: 18px;
+    }
+
+    .message-panel {
+      display: none;
+      border-top: 1px solid var(--line);
+      margin-top: 18px;
+      padding-top: 18px;
+    }
+
+    .message-panel.visible {
+      display: block;
+    }
+
+    .messages {
+      min-height: 164px;
+      max-height: 250px;
+      overflow: auto;
+      padding: 10px;
+      border-radius: 16px;
+      background: rgba(3, 8, 16, 0.7);
+      border: 1px solid rgba(255,255,255,0.04);
+    }
+
+    .msg {
+      margin: 8px 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      line-height: 1.45;
+      font-size: 14px;
+    }
+
+    .msg.user {
+      background: rgba(108, 141, 255, 0.12);
+      margin-left: 28px;
+      border: 1px solid rgba(108, 141, 255, 0.2);
+    }
+
+    .msg.assistant {
+      background: rgba(142, 240, 210, 0.08);
+      margin-right: 28px;
+      border: 1px solid rgba(142, 240, 210, 0.14);
+    }
+
+    form {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    input[type=text] {
+      flex: 1;
+      border-radius: 12px;
+      background: rgba(2, 6, 19, 0.8);
+      border: 1px solid rgba(255,255,255,0.06);
+      color: var(--text);
+      padding: 12px 14px;
+      font-size: 15px;
+    }
+
+    @media (max-width: 900px) {
+      .dashboard { grid-template-columns: 1fr; }
+      .jarvis-shell { width: min(92vw, 900px); }
+    }
+
+    @media (max-width: 640px) {
+      .hud-top {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
+      .controls {
+        width: 100%;
+      }
+      .controls button {
+        flex: 1;
+      }
+      .agent-caption {
+        position: static;
+        padding: 20px 22px 0;
+        display: block;
+      }
+      .agent-panel { min-height: auto; }
+    }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="topbar">
-      <div class="badge" id="statusBadge">Jarvis offline</div>
+  <div class="jarvis-shell">
+    <div class="hud-top">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span>JARVIS SYSTEM</span>
+      </div>
+      <div class="status-pill"><span class="security-dot"></span><span id="statusBadge">Jarvis offline</span></div>
       <div class="controls">
         <button id="toggleButton">Turn on</button>
         <button id="micButton" class="secondary">Use microphone</button>
         <button id="vscodeButton" class="ghost">Open VS Code</button>
+        <button id="chatToggleButton" class="ghost">Hide chat</button>
       </div>
     </div>
-    <div class="messages" id="messages"></div>
-    <form id="chatForm">
-      <input id="messageInput" type="text" placeholder="Type a command or ask a question..." autocomplete="off">
-      <button type="submit">Send</button>
-    </form>
+
+    <div class="dashboard">
+      <section class="agent-panel">
+        <div class="scanlines"></div>
+        <div class="agent-visual">
+          <div class="orb"></div>
+          <canvas id="waveCanvas" width="800" height="120" style="position:absolute; bottom:28px; left:50%; transform:translateX(-50%); width:60%; height:80px; pointer-events:none; opacity:0.95; mix-blend-mode: screen;"></canvas>
+          <div class="agent-caption">
+            <div>
+              <div class="eyebrow">SYSTEM ONLINE</div>
+              <div class="caption-title">JARVIS</div>
+              <div class="caption-sub">Autonomous desktop intelligence</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="system-readout">
+          <div class="readout-box">
+            <span class="readout-label">Core state</span>
+            <div class="readout-value" id="coreState">Standby</div>
+          </div>
+          <div class="readout-box">
+            <span class="readout-label">Voice status</span>
+            <div class="readout-value" id="voiceState">Ready</div>
+          </div>
+          <div class="readout-box">
+            <span class="readout-label">Response mode</span>
+            <div class="readout-value" id="responseMode">Formal</div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side-panel">
+        <div class="side-card">
+          <h3>Telemetry</h3>
+          <div class="metric-row"><span>CPU</span><strong>42%</strong></div>
+          <div class="metric-row"><span>Memory</span><strong>68%</strong></div>
+          <div class="metric-row"><span>Network</span><strong>Stable</strong></div>
+          <div class="metric-row"><span>Tasks</span><strong>7 active</strong></div>
+        </div>
+
+        <div class="side-card">
+          <h3>Command deck</h3>
+          <div class="metric-row"><span>Trigger</span><strong>Jarvis</strong></div>
+          <div class="metric-row"><span>Wake mode</span><strong>Phrase + clap</strong></div>
+          <div class="metric-row"><span>Assistant tone</span><strong>Brief / formal</strong></div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="command-panel">
+      <div class="message-panel visible" id="chatPanel">
+        <div class="messages" id="messages"></div>
+        <form id="chatForm">
+          <input id="messageInput" type="text" placeholder="Type a command or ask a question..." autocomplete="off">
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </div>
   </div>
 
   <script>
     const statusBadge = document.getElementById('statusBadge');
+    const coreState = document.getElementById('coreState');
+    const voiceState = document.getElementById('voiceState');
+    const responseMode = document.getElementById('responseMode');
     const toggleButton = document.getElementById('toggleButton');
     const micButton = document.getElementById('micButton');
     const vscodeButton = document.getElementById('vscodeButton');
+    const chatToggleButton = document.getElementById('chatToggleButton');
+    const chatPanel = document.getElementById('chatPanel');
     const messages = document.getElementById('messages');
     const form = document.getElementById('chatForm');
     const input = document.getElementById('messageInput');
@@ -1382,32 +2187,81 @@ UI_HTML = """
       messages.scrollTop = messages.scrollHeight;
     }
 
-    async function refreshState() {
-      const res = await fetch('/api/state');
-      const data = await res.json();
-      const enabled = !!data.enabled;
-      statusBadge.textContent = enabled ? 'Jarvis online' : 'Jarvis offline';
-      toggleButton.textContent = enabled ? 'Turn off' : 'Turn on';
-      if (Array.isArray(data.history)) {
-        messages.innerHTML = '';
-        data.history.forEach(item => {
-          if (item && item.role && item.content) {
-            addMessage(item.role === 'user' ? 'user' : 'assistant', item.content);
-          }
-        });
+    function updateSystemIndicators(enabled) {
+      const online = !!enabled;
+      statusBadge.textContent = online ? 'Jarvis online' : 'Jarvis offline';
+      coreState.textContent = online ? 'Operational' : 'Standby';
+      voiceState.textContent = online ? 'Listening' : 'Idle';
+      responseMode.textContent = online ? 'Formal' : 'Dormant';
+      toggleButton.textContent = online ? 'Turn off' : 'Turn on';
+
+      const orb = document.querySelector('.orb');
+      if (orb) {
+        if (online) {
+          orb.classList.add('listening');
+        } else {
+          orb.classList.remove('listening');
+        }
       }
     }
 
+    async function refreshState() {
+      try {
+        const res = await fetch('/api/state');
+        const data = await res.json();
+        updateSystemIndicators(data.enabled);
+        if (Array.isArray(data.history)) {
+          messages.innerHTML = '';
+          data.history.forEach(item => {
+            if (item && item.role && item.content) {
+              addMessage(item.role === 'user' ? 'user' : 'assistant', item.content);
+            }
+          });
+        }
+      } catch (err) {
+        console.warn('Failed to refresh state', err);
+      }
+    }
+
+    // Poll system state periodically so the UI reflects listening status in real time
+    setInterval(refreshState, 1500);
+    window.addEventListener('focus', refreshState);
+
     toggleButton.addEventListener('click', async () => {
       const enabled = statusBadge.textContent === 'Jarvis offline';
-      const res = await fetch('/api/toggle', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})});
+      const res = await fetch('/api/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      });
       const data = await res.json();
-      if (data.enabled) {
-        addMessage('assistant', 'Jarvis is online and listening for commands.');
-      } else {
-        addMessage('assistant', 'Jarvis is sleeping.');
-      }
+      updateSystemIndicators(data.enabled);
+      addMessage('assistant', data.enabled ? 'Jarvis is online and ready to receive instructions.' : 'Jarvis is in standby mode.');
       await refreshState();
+    });
+
+    chatToggleButton.addEventListener('click', () => {
+      const visible = chatPanel.classList.toggle('visible');
+      chatToggleButton.textContent = visible ? 'Hide chat' : 'Show chat';
+    });
+
+    vscodeButton.addEventListener('click', async () => {
+      vscodeButton.disabled = true;
+      vscodeButton.textContent = 'Opening...';
+      try {
+        const res = await fetch('/api/open-vscode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: '.' })
+        });
+        const data = await res.json();
+        addMessage('assistant', data.result || 'VS Code command failed.');
+      } catch (error) {
+        addMessage('assistant', 'Unable to open VS Code from the browser environment.');
+      } finally {
+        vscodeButton.disabled = false;
+        vscodeButton.textContent = 'Open VS Code';
+      }
     });
 
     form.addEventListener('submit', async (event) => {
@@ -1440,6 +2294,10 @@ UI_HTML = """
 
       micButton.addEventListener('click', () => {
         if (!listening) {
+          // Tell the backend to stop any active speech so user can barge in cleanly
+          try {
+            fetch('/api/stop_speech', { method: 'POST' }).catch(() => {});
+          } catch (e) {}
           recognition.start();
           micButton.textContent = 'Listening...';
           listening = true;
@@ -1453,7 +2311,11 @@ UI_HTML = """
       recognition.onresult = async (event) => {
         const transcript = event.results[0][0].transcript;
         addMessage('user', transcript);
-        const res = await fetch('/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ message: transcript })});
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: transcript })
+        });
         const data = await res.json();
         addMessage('assistant', data.reply || 'No reply.');
         micButton.textContent = 'Use microphone';
@@ -1475,6 +2337,77 @@ UI_HTML = """
     }
 
     refreshState();
+
+    // WebSocket listener for real-time updates (audio levels, transcripts, state)
+    (function() {
+      let ws = null;
+      const canvas = document.getElementById('waveCanvas');
+      let ctx = null;
+      let levels = new Array(128).fill(0);
+      function initCanvas() {
+        if (!canvas) return;
+        ctx = canvas.getContext('2d');
+        canvas.width = canvas.clientWidth * devicePixelRatio;
+        canvas.height = canvas.clientHeight * devicePixelRatio;
+      }
+      function draw() {
+        if (!ctx) return;
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.clearRect(0,0,w,h);
+        // gradient
+        const grad = ctx.createLinearGradient(0,0,w,0);
+        grad.addColorStop(0, 'rgba(103,217,255,0.28)');
+        grad.addColorStop(1, 'rgba(140,240,210,0.18)');
+        ctx.fillStyle = 'rgba(3,10,18,0.0)';
+        ctx.fillRect(0,0,w,h);
+        ctx.lineWidth = Math.max(2, devicePixelRatio);
+        ctx.strokeStyle = grad;
+        ctx.beginPath();
+        for (let i=0;i<levels.length;i++){
+          const x = (i/levels.length) * w;
+          const y = h - (levels[i] * h);
+          if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        }
+        ctx.stroke();
+        requestAnimationFrame(draw);
+      }
+      function onMessage(ev) {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (!msg || !msg.type) return;
+          if (msg.type === 'audio_level' && msg.payload) {
+            const rms = Math.min(1, Math.max(0, msg.payload.rms || 0));
+            // push to levels ring buffer
+            levels.push(rms);
+            if (levels.length > 128) levels.shift();
+          }
+          if (msg.type === 'transcript' && msg.payload) {
+            const t = msg.payload.text || '';
+            if (t) addMessage('user', t);
+          }
+          if (msg.type === 'state' && msg.payload) {
+            updateSystemIndicators(msg.payload.enabled);
+          }
+        } catch (e) {
+          console.warn('WS message parse error', e);
+        }
+      }
+      function connect() {
+        try {
+          ws = new WebSocket('ws://127.0.0.1:8765');
+          ws.onopen = () => console.info('WS connected');
+          ws.onmessage = onMessage;
+          ws.onclose = () => { setTimeout(connect, 1200); };
+          ws.onerror = () => { /* reconnect handled on close */ };
+        } catch (e) {
+          setTimeout(connect, 1500);
+        }
+      }
+      initCanvas(); draw(); connect();
+      window.addEventListener('resize', initCanvas);
+    })();
+
   </script>
 </body>
 </html>

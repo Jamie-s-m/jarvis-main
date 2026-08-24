@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -29,10 +30,25 @@ def create_vscode_project(project_name: str, template: str = "python", root_dir:
     (project_dir / "src" / "main.py").write_text("print('Project ready for Jarvis.')\n", encoding="utf-8")
     (project_dir / ".vscode" / "settings.json").write_text(json.dumps({"files.exclude": {"**/__pycache__": True}}, indent=2), encoding="utf-8")
 
-    cli = next((name for name in ["code", "code.cmd", "code-insiders", "code-insiders.cmd"] if shutil.which(name)), None)
+    cli = next((candidate for candidate in ["code", "code.cmd", "code-insiders", "code-insiders.cmd", "codium", "codium.cmd"] if shutil.which(candidate)), None)
     if cli:
         try:
-            subprocess.run([cli, str(project_dir)], check=True, capture_output=True, text=True)
+            subprocess.Popen([cli, str(project_dir)], shell=False)
+            return f"Created and opened project '{name}' in VS Code."
+        except Exception:
+            return f"Created project '{name}' at '{project_dir}'. Open it manually in VS Code."
+
+    windows_candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code Insiders" / "Code - Insiders.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft VS Code" / "Code.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft VS Code" / "Code.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "VSCodium" / "VSCodium.exe",
+    ]
+    exe_path = next((candidate for candidate in windows_candidates if candidate.exists()), None)
+    if exe_path:
+        try:
+            subprocess.Popen([str(exe_path), str(project_dir)], shell=False)
             return f"Created and opened project '{name}' in VS Code."
         except Exception:
             return f"Created project '{name}' at '{project_dir}'. Open it manually in VS Code."
@@ -40,16 +56,31 @@ def create_vscode_project(project_name: str, template: str = "python", root_dir:
 
 
 def open_in_vscode(target_path: str = ".") -> str:
-    """Open a workspace or file in VS Code if the CLI is installed."""
+    """Open a workspace or file in VS Code if the CLI or common installation is available."""
     path = Path(target_path).expanduser().resolve() if target_path and target_path.strip() else Path.cwd()
-    cli = next((name for name in ["code", "code.cmd", "code-insiders", "code-insiders.cmd"] if shutil.which(name)), None)
-    if not cli:
-        return "VS Code CLI is not installed or not on PATH."
-    try:
-        subprocess.run([cli, str(path)], check=True, capture_output=True, text=True)
-        return f"Opened '{path}' in VS Code."
-    except Exception as exc:  # pragma: no cover
-        return f"Failed to open VS Code: {exc}"
+    cli = next((candidate for candidate in ["code", "code.cmd", "code-insiders", "code-insiders.cmd", "codium", "codium.cmd"] if shutil.which(candidate)), None)
+    if cli:
+        try:
+            subprocess.Popen([cli, str(path)], shell=False)
+            return f"Opened '{path}' in VS Code."
+        except Exception as exc:  # pragma: no cover
+            return f"Failed to open VS Code: {exc}"
+
+    windows_candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code Insiders" / "Code - Insiders.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft VS Code" / "Code.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft VS Code" / "Code.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "VSCodium" / "VSCodium.exe",
+    ]
+    exe_path = next((candidate for candidate in windows_candidates if candidate.exists()), None)
+    if exe_path:
+        try:
+            subprocess.Popen([str(exe_path), str(path)], shell=False)
+            return f"Opened '{path}' in VS Code."
+        except Exception as exc:  # pragma: no cover
+            return f"Failed to open VS Code via executable path: {exc}"
+    return "VS Code CLI is not installed or not on PATH. Install the 'code' command or open VS Code manually, then retry."
 
 
 def self_development() -> str:
