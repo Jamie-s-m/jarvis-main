@@ -17,6 +17,14 @@
       {
         "command": "jarvis.startEngine",
         "title": "JARVIS: Start Engine"
+      },
+      {
+        "command": "jarvis.stopEngine",
+        "title": "JARVIS: Stop Engine"
+      },
+      {
+        "command": "jarvis.restartEngine",
+        "title": "JARVIS: Restart Engine"
       }
     ],
     "views": {

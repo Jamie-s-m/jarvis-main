@@ -119,13 +119,11 @@ class LLMRouter:
                         # propagate error to fallback below
                         raise Exception(item.get("__error__"))
                     text = str(item)
-                    # yield in small chunks for responsive UI
-                    i = 0
-                    L = len(text)
-                    while i < L:
-                        end = min(L, i + chunk_size)
-                        yield text[i:end]
-                        i = end
+                    # yield in small tokens by word-boundaries for smoother fallback streaming
+                    import re as _re
+                    tokens = _re.findall(r"\s*\S+", text)
+                    for tok in tokens:
+                        yield tok
 
                 # final: get a full response (fallback) and include executed tools
                 full = self.route_query(query, tools=tools, system_prompt=system_prompt, executed_tools=executed_tools)
@@ -168,16 +166,14 @@ class LLMRouter:
             except Exception as exc:
                 log.exception("OpenAI streaming failed, falling back to chunking: %s", exc)
 
-        # Fallback: synchronous non-streaming call, chunked into small pieces for simulated streaming
+        # Fallback: synchronous non-streaming call, yield sensible word/punctuation tokens for a natural stream
         full = self.route_query(query, tools=tools, system_prompt=system_prompt, executed_tools=executed_tools)
         if not full:
             return
-        i = 0
-        L = len(full)
-        while i < L:
-            end = min(L, i + chunk_size)
-            yield full[i:end]
-            i = end
+        import re as _re
+        tokens = _re.findall(r"\s*\S+", full)
+        for tok in tokens:
+            yield tok
         # final yield: signal completion with a special object
         yield {"__final__": True, "response": full, "executed_tools": executed_tools}
 

@@ -43,8 +43,10 @@ export function activate(context: vscode.ExtensionContext) {
                 // Spawn the packaged executable
                 child = cp.spawn(exePath, [], { detached: true, stdio: 'ignore', shell: false });
                 child.unref();
+                engineProcess = child;
+                engineMode = 'exe';
                 vscode.window.showInformationMessage('JARVIS engine started (packaged executable).');
-                vscode.window.setStatusBarMessage('JARVIS: running (exe)', 5000);
+                statusItem.text = `$(play-circle) JARVIS: Running (EXE - PID: ${child.pid})`;
             } else {
                 // Fallback: spawn Python script
                 const python = process.platform === 'win32' ? 'python' : 'python3';
@@ -53,14 +55,88 @@ export function activate(context: vscode.ExtensionContext) {
                 if (wf && fs.existsSync(path.join(wf, 'jarvis_desktop.py'))) script = path.join(wf, 'jarvis_desktop.py');
                 child = cp.spawn(python, [script], { detached: true, stdio: 'ignore', shell: false });
                 child.unref();
+                engineProcess = child;
+                engineMode = 'script';
                 vscode.window.showInformationMessage('JARVIS engine started (python script).');
-                vscode.window.setStatusBarMessage('JARVIS: running (python)', 5000);
+                statusItem.text = `$(symbol-event) JARVIS: Running (Script - PID: ${child.pid})`;
             }
         } catch (err) {
             vscode.window.showErrorMessage('Failed to spawn JARVIS engine: ' + String(err));
+            engineProcess = null;
+            engineMode = null;
+            statusItem.text = '$(circle-slash) JARVIS: Offline';
         }
     });
     context.subscriptions.push(startCmd);
+
+    // Stop engine command
+    const stopCmd = vscode.commands.registerCommand('jarvis.stopEngine', async () => {
+        try {
+            if (!engineProcess || !engineProcess.pid) {
+                vscode.window.showInformationMessage('JARVIS is not running.');
+                engineProcess = null;
+                engineMode = null;
+                statusItem.text = '$(circle-slash) JARVIS: Offline';
+                return;
+            }
+            const pid = engineProcess.pid;
+            if (process.platform === 'win32') {
+                // Use taskkill to kill process tree on Windows
+                try {
+                    cp.spawnSync('taskkill', ['/PID', String(pid), '/T', '/F']);
+                } catch (e) {
+                    try { engineProcess.kill(); } catch (e) {}
+                }
+            } else {
+                try {
+                    // kill process group
+                    process.kill(-pid, 'SIGTERM');
+                } catch (e) {
+                    try { process.kill(pid, 'SIGTERM'); } catch (ee) {}
+                }
+            }
+            engineProcess = null;
+            engineMode = null;
+            statusItem.text = '$(circle-slash) JARVIS: Offline';
+            vscode.window.showInformationMessage('JARVIS engine stopped.');
+        } catch (err) {
+            vscode.window.showErrorMessage('Failed to stop engine: ' + String(err));
+        }
+    });
+    context.subscriptions.push(stopCmd);
+
+    // Restart command simply stops then starts
+    const restartCmd = vscode.commands.registerCommand('jarvis.restartEngine', async () => {
+        await vscode.commands.executeCommand('jarvis.stopEngine');
+        // short delay then start
+        setTimeout(() => vscode.commands.executeCommand('jarvis.startEngine'), 800);
+    });
+    context.subscriptions.push(restartCmd);
+
+    // Status bar item + engine process tracking
+    let engineProcess: any = null;
+    let engineMode: 'exe' | 'script' | null = null;
+    const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusItem.text = '$(circle-slash) JARVIS: Offline';
+    statusItem.command = 'jarvis.showEngineMenu';
+    statusItem.show();
+    context.subscriptions.push(statusItem);
+
+    // Command to show quick-pick when status item clicked
+    const showMenuCmd = vscode.commands.registerCommand('jarvis.showEngineMenu', async () => {
+        const pick = await vscode.window.showQuickPick(['View HUD', 'Stop Engine', 'Restart Engine'], { placeHolder: 'JARVIS Engine' });
+        if (!pick) return;
+        if (pick === 'View HUD') {
+            try { await vscode.commands.executeCommand('workbench.view.extension.jarvisHud'); } catch (e) { /* best-effort */ }
+        }
+        if (pick === 'Stop Engine') {
+            await vscode.commands.executeCommand('jarvis.stopEngine');
+        }
+        if (pick === 'Restart Engine') {
+            await vscode.commands.executeCommand('jarvis.restartEngine');
+        }
+    });
+    context.subscriptions.push(showMenuCmd);
 
     // Register webview sidebar (JARVIS HUD)
     const provider = new JarvisHudProvider(context.extensionUri);
