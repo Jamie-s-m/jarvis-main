@@ -177,52 +177,54 @@ This produces an executable in the `dist` folder.
 
 ## Current project status
 
-The project is ready for local desktop use and for further extension. It already includes:
-- user-friendly web UI
-- persistent memory
-- wake detection logic
-- tool execution
-- code review and project scaffolding
-- VS Code integration
+The project is now fully prepared for local desktop usage and developer workflows. Recent production-ready upgrades completed in this branch include:
+- Provider-native streaming hooks for Anthropic & OpenAI (best-effort)
+- SSE token streaming endpoint at /api/chat/stream for low-latency chat
+- ElevenLabs decoding via pydub + ffmpeg fallback and pyttsx3 fallback
+- Deepgram ASR adapter (optional, requires DEEPGRAM_API_KEY)
+- Dynamic tool generation with AST safety checks and HUD approval flow
+- VS Code extension with HUD, Chat participant, auto-detect dist\JarvisAgent.exe launcher, persistent status bar, and stop/restart commands
 
-## Support and next steps
+Ready-to-use checklist (do these once)
+1. Copy and edit .env with API keys and preferences:
+  - DEEPGRAM_API_KEY, ELEVENLABS_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, LLM_PROVIDER
+2. Install OS-level dependency: ffmpeg on PATH (required for pydub audio decoding).
+3. Install Python dependencies:
+  - pip install -r requirements.txt
+4. Install and build the VS Code extension:
+  - cd vscode-extension
+  - npm install
+  - npm run compile
+5. (Optional) Build a packaged backend executable:
+  - Use PyInstaller or your preferred packager to produce dist\JarvisAgent.exe and place it in workspace/dist/ or extension/dist/ so the extension and Electron wrapper auto-detect it.
 
-For deeper improvements, see [DEVELOPMENT.md](./DEVELOPMENT.md).
+Running locally (developer-friendly)
+- Start backend (development):
+ python jarvis_desktop.py
 
----
+- Start the VS Code extension HUD (development):
+ - Open vscode-extension in VS Code
+ - npm run compile
+ - Press F5 to run the Extension Development Host
+ - Use the StatusBar item or Command Palette (JARVIS: Start Engine) to start the engine
 
-## Electron native wrapper (new)
+- Test SSE streaming manually:
+ curl -N -H "Content-Type: application/json" -X POST -d "{\"message\":\"Hello\"}" http://127.0.0.1:5000/api/chat/stream
 
-An Electron-based native wrapper has been added to provide a standalone cinematic desktop app experience. Files added:
-- [package.json](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/package.json)
-- [main.js](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/main.js)
-- [preload.js](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/preload.js)
-- [start_electron.bat](C:/Users/morea/Downloads/jarvis-main.worktrees/fully-functional-ai-agent-upgrade/start_electron.bat)
+Developer notes and further work
+- See DEVELOPMENT.md for architecture, extension internals, provider adapters, security model, and packaging guidance.
+- The dynamic tool safety flow stores pending proposals in the agent memory and broadcasts proposals to HUD via WebSocket. Approvals trigger /api/confirm_tool to apply the code to custom_tools.py.
 
-What it does:
-- Launches the Python desktop server (jarvis_desktop.py) automatically (prefers .venv\Scripts\python.exe when present)
-- Opens a frameless BrowserWindow that loads the HUD at http://127.0.0.1:5000
-- Ensures single-instance behavior and tries to terminate the server when the Electron app quits
+Electron wrapper
+- Electron assets are included for a native cinematic UI. Recommended production flow: build a self-contained dist\JarvisAgent.exe and have Electron spawn that instead of a Python script.
 
-Development run (quick):
-1. Ensure Python venv and dependencies are installed (use install_windows.ps1)
-2. Install Node + npm
-3. In project root run:
-   npm install
-   npm start
+Support & Troubleshooting
+- If audio is silent: confirm ffmpeg is installed and pyttsx3 is available (or ElevenLabs API key is set).
+- If streaming is slow: check your LLM_PROVIDER and API key, network conditions, and provider service limits.
+- If the extension fails to spawn the backend: ensure Python is on PATH or that dist\JarvisAgent.exe is present in the expected locations.
 
-Packaging notes:
-- electron-builder configuration is included in package.json. To produce a Windows installer (NSIS):
-  1. npm install --save-dev electron electron-builder
-  2. npx electron-builder --win --x64
-- Recommended production flow: create a PyInstaller-built dist\JarvisAgent.exe and modify main.js to spawn that executable (safer for end users who don't want to manage Python).
+Want me to finish packaging and produce an installer?
+- I can prepare an Electron + installer build that bundles a PyInstaller-built backend exe and ffmpeg. Reply and indicate whether to bundle a Python runtime and ffmpeg or to require users to install them separately.
 
-Next recommended steps (can implement on request):
-- Switch main.js to detect and spawn dist\JarvisAgent.exe if present (recommended for final installer builds).
-- Implement WebSocket push + waveform streaming so the native window shows real-time mic levels and interim ASR transcripts (this is the next priority to make the HUD live).
-- Add tray, media keys, and global hotkeys for wake/stop behaviors.
-
-If you'd like me to continue, confirm whether to:
-- Use dist\\JarvisAgent.exe as the canonical backend to spawn from Electron (recommended), and
-- Implement WebSocket push + waveform streaming next so the native app has live feedback.
+For deeper developer instructions see [DEVELOPMENT.md](./DEVELOPMENT.md).
 

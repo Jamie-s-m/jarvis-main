@@ -258,3 +258,48 @@ The app is intentionally designed to be extendable and easy to understand. If yo
 5. more polished desktop installation and startup UX
 
 That combination will turn JARVIS into a far more complete, reliable personal desktop agent.
+
+---
+
+## Final readiness checklist (for developers)
+
+Follow these steps to make a local JARVIS installation "production-ready" for end users:
+
+1. Prepare environment and secrets
+   - Create and populate `.env` in the repository root with all required API keys: `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`. Set `LLM_PROVIDER` appropriately.
+   - Install ffmpeg and ensure it is available on PATH (required for audio decoding with pydub).
+
+2. Install and validate dependencies
+   - python -m venv .venv
+   - .\.venv\Scripts\activate
+   - pip install -r requirements.txt
+   - cd vscode-extension && npm install && npm run compile
+
+3. Validate runtime locally
+   - Launch the backend for manual testing:
+     python jarvis_desktop.py
+   - Open the HUD in a browser at http://127.0.0.1:5000 or launch the VS Code extension (F5 in Extension Development Host).
+   - Test endpoints:
+     - GET /api/state
+     - POST /api/chat with a sample message
+     - POST /api/chat/stream to confirm SSE streaming
+
+4. Package backend (recommended for end users)
+   - Install PyInstaller in the venv: pip install pyinstaller
+   - Build an optimized executable (example):
+     pyinstaller --onefile --add-data "<path-to-ffmpeg>\ffmpeg.exe;ffmpeg" jarvis_desktop.py
+   - Copy the produced exe into `dist\JarvisAgent.exe` and verify the VS Code extension or Electron launcher detects and spawns it.
+
+5. Build Electron installer (optional)
+   - In the project root, install electron-builder and build tools and configure package.json as needed.
+   - Add the packaged `dist\JarvisAgent.exe` as the preferred backend for the Electron main process.
+
+6. Security hardening
+   - Run dynamic tool code (approved via HUD) in an isolated environment (container or separate restricted user account) for extra safety.
+   - Add multi-step confirmations for destructive tool actions.
+
+7. CI and tests
+   - Add unit tests for AST safety checks, stream parsing, and tool execution wrappers.
+   - Add integration tests that start the backend and call the main endpoints in a disposable environment.
+
+If you'd like, I can prepare the packaging scripts (PyInstaller spec, electron-builder config) and add CI test scaffolding next. Otherwise, these docs should make it straightforward for other developers to run and extend JARVIS.
