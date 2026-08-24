@@ -47,6 +47,11 @@ except ImportError:  # pragma: no cover
     sr = None
 
 try:
+    from tools.deepgram_asr import get_deepgram_asr
+except Exception:
+    get_deepgram_asr = None
+
+try:
     import psutil
 except ImportError:  # pragma: no cover
     psutil = None
@@ -1033,10 +1038,6 @@ class VoiceEngine:
                 log.warning("pyttsx3 voice output failed: %s", exc)
         log.info("Speech output is unavailable because no TTS backend is configured.")
         return False
-                log.warning("pyttsx3 voice output failed: %s", exc)
-        log.info("Speech output is unavailable because no TTS backend is configured.")
-        return False
-
 
 class CommandIntentEngine:
     """Classifies commands before falling back to the LLM, improving reliability."""
@@ -1232,6 +1233,41 @@ class JarvisAgent:
                 self.speech_stop_event.clear()
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_deepgram_final(self, text: str, is_final: bool) -> None:
+        """Callback for final transcripts from Deepgram ASR adapter."""
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+        try:
+            from ws_broadcaster import broadcast_sync
+            broadcast_sync({"type": "transcript", "payload": {"text": cleaned}})
+        except Exception:
+            pass
+        try:
+            if self.wake_detector.is_available():
+                self.wake_detector.listen()
+        except Exception:
+            pass
+        lowered = cleaned.lower()
+        if self.wake_detector.phrase_matches(cleaned):
+            self.speak("At your service.")
+            command = cleaned
+            for prefix in [f"hi {WAKE_WORD}", f"hey {WAKE_WORD}", f"hello {WAKE_WORD}", WAKE_WORD]:
+                if prefix in command.lower():
+                    command = command.lower().replace(prefix, "", 1).strip()
+                    break
+            command = command.strip() or "What can you do?"
+            try:
+                self.process_user_query(command)
+            except Exception:
+                pass
+        elif "turn off" in lowered or "sleep" in lowered:
+            try:
+                self.turn_off()
+                self.speak("Goodbye.")
+            except Exception:
+                pass
 
     def _command_priority_response(self, query: str) -> Optional[str]:
         q = query.lower().strip()
@@ -1467,6 +1503,17 @@ class JarvisAgent:
 
         self.listener_stop_event.clear()
 
+        # Initialize Deepgram ASR adapter (if available)
+        try:
+            if get_deepgram_asr:
+                try:
+                    self._deepgram_asr = get_deepgram_asr(callback=self._on_deepgram_final)
+                    self._deepgram_asr.start()
+                except Exception:
+                    self._deepgram_asr = None
+        except Exception:
+            self._deepgram_asr = None
+
         def record_with_sounddevice(duration: float = 3.0, sample_rate: int = 16000):
             try:
                 recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
@@ -1522,6 +1569,16 @@ class JarvisAgent:
                         raw_audio = np.frombuffer(audio.get_raw_data(convert_rate=16000, convert_width=2), dtype=np.int16)
                     except Exception:
                         raw_audio = None
+
+                # Forward raw PCM bytes to Deepgram ASR for interim transcripts and early intent detection
+                try:
+                    if raw_audio is not None and getattr(self, "_deepgram_asr", None) is not None:
+                        try:
+                            self._deepgram_asr.send_raw(raw_audio.tobytes())
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
                 # compute and broadcast simple audio level metrics (RMS / peak)
                 try:
