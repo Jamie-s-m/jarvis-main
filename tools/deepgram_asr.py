@@ -138,6 +138,21 @@ class DeepgramASR:
                         broadcast_sync({"type": "transcript", "payload": {"text": text, "is_final": bool(is_final)}})
                     except Exception:
                         pass
+
+                    # Backend-level immediate barge-in: if interim transcript while voice is playing, stop it
+                    if not is_final and text.strip():
+                        try:
+                            import importlib
+                            jarvis_mod = importlib.import_module('jarvis')
+                            VoiceEngine = getattr(jarvis_mod, 'VoiceEngine', None)
+                            if VoiceEngine is not None and getattr(VoiceEngine, '_is_playing', False):
+                                try:
+                                    VoiceEngine.stop()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
                     if is_final and self.callback and text.strip():
                         try:
                             # call callback in a separate thread to avoid blocking

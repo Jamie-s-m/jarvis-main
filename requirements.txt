@@ -12,4 +12,5 @@ requests>=2.31,<3
 ollama>=0.1.0,<1
 psutil>=5.9,<7
 pvporcupine>=3.0.0,<4; platform_system == "Windows" or platform_system == "Linux"
-pyinstaller>=6.0,<7
+pyinstaller>=6.0,<7\r\n
+pydub>=0.25.1

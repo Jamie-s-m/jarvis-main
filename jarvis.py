@@ -922,9 +922,48 @@ class VoiceEngine:
 
         # simpleaudio expects raw PCM; many TTS SDKs return WAV or mp3 bytes. We attempt to play WAV by using sa.WaveObject.from_wave_file-like API.
         try:
-            # try loading via sa.WaveObject
-            wave_obj = sa.WaveObject(audio_bytes, num_channels, bytes_per_sample, sample_rate)
-            play_obj = wave_obj.play()
+            # First attempt: if bytes are a WAV or raw PCM acceptable by simpleaudio, try to play directly
+            # Detect common container signatures for WAV/RIFF
+            is_wav = isinstance(audio_bytes, (bytes, bytearray)) and len(audio_bytes) > 12 and audio_bytes[:4] == b'RIFF' and audio_bytes[8:12] == b'WAVE'
+            if is_wav:
+                try:
+                    wave_obj = sa.WaveObject(audio_bytes, num_channels, bytes_per_sample, sample_rate)
+                    play_obj = wave_obj.play()
+                except Exception:
+                    play_obj = None
+            else:
+                play_obj = None
+
+            # If no direct play, try to decode via pydub (supports mp3/ogg/flac) then play raw PCM
+            if play_obj is None:
+                try:
+                    from pydub import AudioSegment
+                    from io import BytesIO
+                    buf = BytesIO(audio_bytes)
+                    # let pydub detect format
+                    segment = AudioSegment.from_file(buf)
+                    # normalize to expected playback params
+                    segment = segment.set_frame_rate(sample_rate).set_channels(num_channels).set_sample_width(bytes_per_sample)
+                    pcm_bytes = segment.raw_data
+                    play_obj = sa.play_buffer(pcm_bytes, num_channels, bytes_per_sample, sample_rate)
+                except Exception:
+                    # pydub/ffmpeg not available or decode failed; try safe fallback below
+                    play_obj = None
+
+            # Final fallback: attempt to use WaveObject constructor directly with raw audio_bytes (best-effort)
+            if play_obj is None:
+                try:
+                    play_obj = sa.play_buffer(audio_bytes, num_channels, bytes_per_sample, sample_rate)
+                except Exception:
+                    play_obj = None
+
+            if play_obj is None:
+                # give up gracefully
+                with VoiceEngine._playback_lock:
+                    VoiceEngine._play_obj = None
+                    VoiceEngine._is_playing = False
+                return None
+
             with VoiceEngine._playback_lock:
                 VoiceEngine._play_obj = play_obj
                 VoiceEngine._is_playing = True
@@ -941,26 +980,9 @@ class VoiceEngine:
                 VoiceEngine._is_playing = False
             return None
         except Exception:
-            # fallback: attempt sa.play_buffer with decoded PCM - best-effort not implemented here
-            try:
-                play_obj = sa.play_buffer(audio_bytes, num_channels, bytes_per_sample, sample_rate)
-                with VoiceEngine._playback_lock:
-                    VoiceEngine._play_obj = play_obj
-                    VoiceEngine._is_playing = True
-                while play_obj.is_playing() and VoiceEngine._is_playing:
-                    time.sleep(0.05)
-                if play_obj.is_playing() and not VoiceEngine._is_playing:
-                    try:
-                        play_obj.stop()
-                    except Exception:
-                        pass
-                with VoiceEngine._playback_lock:
-                    VoiceEngine._play_obj = None
-                    VoiceEngine._is_playing = False
-            except Exception:
-                with VoiceEngine._playback_lock:
-                    VoiceEngine._play_obj = None
-                    VoiceEngine._is_playing = False
+            with VoiceEngine._playback_lock:
+                VoiceEngine._play_obj = None
+                VoiceEngine._is_playing = False
             return None
 
     @staticmethod
@@ -1405,8 +1427,74 @@ class JarvisAgent:
                     options={"num_predict": 1024, "temperature": 0.2},
                 )
                 code = extract_python_code(response.get("message", {}).get("content", ""))
-                parsed = ast.parse(code)
+                try:
+                    parsed = ast.parse(code)
+                except Exception as exc:
+                    parsed = None
                 if parsed and code.strip():
+                    # AST safety checks
+                    forbidden_reasons = []
+                    forbidden_imports = {"os", "subprocess", "shutil", "socket", "ctypes", "winreg"}
+                    forbidden_call_keywords = {"system", "popen", "remove", "rmtree", "rmdir", "unlink", "shutdown", "kill", "exec", "eval"}
+
+                    for node in ast.walk(parsed):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                if alias.name.split('.')[0] in forbidden_imports:
+                                    forbidden_reasons.append(f"Import of forbidden module: {alias.name}")
+                        elif isinstance(node, ast.ImportFrom):
+                            mod = (node.module or "").split('.')[0]
+                            if mod in forbidden_imports:
+                                forbidden_reasons.append(f"Import-from of forbidden module: {node.module}")
+                        elif isinstance(node, ast.Call):
+                            # extract function name if possible
+                            func = node.func
+                            fname = None
+                            if isinstance(func, ast.Name):
+                                fname = func.id
+                            elif isinstance(func, ast.Attribute):
+                                try:
+                                    # get attr chain like os.system
+                                    value = func
+                                    parts = []
+                                    while isinstance(value, ast.Attribute):
+                                        parts.append(value.attr)
+                                        value = value.value
+                                    if isinstance(value, ast.Name):
+                                        parts.append(value.id)
+                                    full = '.'.join(reversed(parts))
+                                    fname = full
+                                except Exception:
+                                    fname = None
+                            if fname:
+                                lower = fname.lower()
+                                for kw in forbidden_call_keywords:
+                                    if kw in lower:
+                                        forbidden_reasons.append(f"Forbidden function or call pattern detected: {fname}")
+                        elif isinstance(node, ast.Attribute):
+                            # attribute access like os.remove
+                            try:
+                                if isinstance(node.value, ast.Name) and node.value.id in forbidden_imports:
+                                    forbidden_reasons.append(f"Attribute access on forbidden module: {node.value.id}.{node.attr}")
+                            except Exception:
+                                pass
+
+                    if forbidden_reasons:
+                        # store pending proposal and require explicit user confirmation before writing
+                        pending = {
+                            "timestamp": time.time(),
+                            "spec": spec,
+                            "code": code,
+                            "reasons": forbidden_reasons,
+                        }
+                        self.memory.setdefault("pending_tool_proposals", []).append(pending)
+                        self.save_state()
+                        return (
+                            "Generated code contains potentially dangerous operations and was NOT applied automatically. "
+                            "Reasons: " + ", ".join(forbidden_reasons) + ".\nPlease review and confirm explicitly to apply this change."
+                        )
+
+                    # safe to write
                     function_nodes = [node for node in parsed.body if isinstance(node, ast.FunctionDef)]
                     if function_nodes:
                         current = CUSTOM_TOOLS_FILE.read_text(encoding="utf-8")
@@ -1723,6 +1811,35 @@ class JarvisAgent:
                 return jsonify({"stopped": True})
             except Exception as exc:
                 return jsonify({"stopped": False, "error": str(exc)}), 500
+
+        @app.route("/api/confirm_tool", methods=["POST"])
+        def api_confirm_tool():
+            payload = request.get_json(silent=True) or {}
+            index = int(payload.get("index", -1))
+            confirm = bool(payload.get("confirm", False))
+            proposals = self.memory.get("pending_tool_proposals", [])
+            if index < 0 or index >= len(proposals):
+                return jsonify({"error": "Invalid proposal index"}), 400
+            if not confirm:
+                # remove proposal as rejected
+                proposals.pop(index)
+                self.memory["pending_tool_proposals"] = proposals
+                self.save_state()
+                return jsonify({"result": "rejected"})
+            proposal = proposals.pop(index)
+            code = proposal.get("code", "")
+            try:
+                # final AST safety check before writing
+                parsed = ast.parse(code)
+                # write to custom tools file
+                current = CUSTOM_TOOLS_FILE.read_text(encoding="utf-8")
+                CUSTOM_TOOLS_FILE.write_text(current + "\n\n" + code + "\n", encoding="utf-8")
+                self.memory["pending_tool_proposals"] = proposals
+                self.memory.setdefault("self_improvement_log", []).append({"timestamp": time.time(), "result": "applied_pending_tool"})
+                self.save_state()
+                return jsonify({"result": "applied"})
+            except Exception as exc:
+                return jsonify({"error": f"Failed to apply proposal: {exc}"}), 500
 
         @app.route("/api/history")
         def api_history():
