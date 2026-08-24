@@ -48,15 +48,130 @@ class LLMRouter:
             return self._call_openai(query, tools, system_prompt, executed_tools)
 
     def stream_query(self, query: str, tools: Optional[Dict[str, Any]] = None, system_prompt: str = "", chunk_size: int = 32):
-        """Generator that yields tokens (strings). If the provider supports streaming, it should yield as tokens arrive.
-        Otherwise, falls back to generating the full response and yielding it in chunks."""
+        """Generator that yields tokens (strings). If the provider supports streaming, it yields as tokens arrive.
+        Falls back to chunking the full response when native streaming is unavailable or fails.
+        """
         tools = tools or {}
         executed_tools = []
-        # attempt provider-native streaming could be implemented here; fallback to chunking full output
+
+        # Anthropic native streaming (best-effort). Uses AsyncAnthropic.messages.stream when available.
+        if self.provider == "anthropic" and ANTHROPIC_API_KEY:
+            try:
+                import queue as _queue
+                import threading as _threading
+                import asyncio as _asyncio
+
+                q: _queue.Queue = _queue.Queue()
+                sentinel = object()
+
+                async def _run_anthropic_stream():
+                    try:
+                        from anthropic import AsyncAnthropic
+                        client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+                        messages = []
+                        if system_prompt:
+                            messages.append({"role": "system", "content": system_prompt})
+                        messages.append({"role": "user", "content": query})
+
+                        # The AsyncAnthropic API exposes a streaming iterator for messages
+                        async for event in client.messages.stream(model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet"), messages=messages):
+                            # event may include incremental text in different keys depending on SDK; attempt to extract
+                            try:
+                                if isinstance(event, dict):
+                                    # common keys: 'delta', 'completion', or 'content'
+                                    if 'delta' in event and isinstance(event['delta'], dict):
+                                        text = event['delta'].get('content') or ''
+                                    else:
+                                        text = event.get('completion') or event.get('content') or ''
+                                else:
+                                    text = str(event or '')
+                            except Exception:
+                                text = str(event or '')
+
+                            if text:
+                                q.put(text)
+                    except Exception as exc:
+                        q.put({"__error__": str(exc)})
+                    finally:
+                        q.put(sentinel)
+
+                def _thread_target():
+                    loop = _asyncio.new_event_loop()
+                    try:
+                        _asyncio.set_event_loop(loop)
+                        loop.run_until_complete(_run_anthropic_stream())
+                    finally:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
+
+                t = _threading.Thread(target=_thread_target, daemon=True)
+                t.start()
+
+                # Consume queue and yield tokens as they arrive
+                buffer = ""
+                while True:
+                    item = q.get()
+                    if item is sentinel:
+                        break
+                    if isinstance(item, dict) and item.get("__error__"):
+                        # propagate error to fallback below
+                        raise Exception(item.get("__error__"))
+                    text = str(item)
+                    # yield in small chunks for responsive UI
+                    i = 0
+                    L = len(text)
+                    while i < L:
+                        end = min(L, i + chunk_size)
+                        yield text[i:end]
+                        i = end
+
+                # final: get a full response (fallback) and include executed tools
+                full = self.route_query(query, tools=tools, system_prompt=system_prompt, executed_tools=executed_tools)
+                yield {"__final__": True, "response": full, "executed_tools": executed_tools}
+                return
+            except Exception as exc:  # fallback to non-streaming behavior
+                log.exception("Anthropic streaming failed, falling back to chunking: %s", exc)
+
+        # OpenAI native streaming (best-effort)
+        if self.provider == "openai" and OPENAI_API_KEY:
+            try:
+                try:
+                    import openai
+                except Exception:
+                    openai = None
+                if openai is not None:
+                    openai.api_key = OPENAI_API_KEY
+                    messages = []
+                    if system_prompt:
+                        messages.append({"role": "system", "content": system_prompt})
+                    messages.append({"role": "user", "content": query})
+                    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+                    # This will yield chunks from the OpenAI streaming API when available
+                    stream_iter = openai.ChatCompletion.create(model=model, messages=messages, stream=True)
+                    full = ""
+                    for chunk in stream_iter:
+                        try:
+                            choices = chunk.get("choices") or []
+                            if choices:
+                                delta = choices[0].get("delta") or choices[0].get("message") or {}
+                                token = delta.get("content") if isinstance(delta, dict) else ""
+                                if token:
+                                    full += token
+                                    yield token
+                        except Exception:
+                            # ignore malformed chunk
+                            continue
+                    yield {"__final__": True, "response": full, "executed_tools": executed_tools}
+                    return
+            except Exception as exc:
+                log.exception("OpenAI streaming failed, falling back to chunking: %s", exc)
+
+        # Fallback: synchronous non-streaming call, chunked into small pieces for simulated streaming
         full = self.route_query(query, tools=tools, system_prompt=system_prompt, executed_tools=executed_tools)
         if not full:
             return
-        # simple chunk by characters to simulate streaming tokens
         i = 0
         L = len(full)
         while i < L:

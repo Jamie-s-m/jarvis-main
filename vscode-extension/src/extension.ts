@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const SERVER_URL = 'http://127.0.0.1:5000';
 const WS_URL = 'ws://127.0.0.1:8765';
@@ -7,7 +9,7 @@ const WS_URL = 'ws://127.0.0.1:8765';
 export function activate(context: vscode.ExtensionContext) {
     console.log('Activating JARVIS extension');
 
-    // Command to start the engine
+    // Command to start the engine (auto-detect dist/JarvisAgent.exe)
     const startCmd = vscode.commands.registerCommand('jarvis.startEngine', async () => {
         try {
             const resp = await fetch(SERVER_URL + '/api/state', { method: 'GET' });
@@ -19,17 +21,41 @@ export function activate(context: vscode.ExtensionContext) {
             // not running — spawn
         }
 
-        // Spawn jarvis_desktop.py in a detached background process
+        // Determine candidate executable paths
+        const extRoot = context.extensionUri && (context.extensionUri.fsPath || context.extensionUri.path) ? (context.extensionUri.fsPath || context.extensionUri.path) : undefined;
+        const candidates: string[] = [];
+        if (extRoot) candidates.push(path.join(extRoot, 'dist', 'JarvisAgent.exe'));
+        // also check workspace folder
+        const wf = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length ? vscode.workspace.workspaceFolders[0].uri.fsPath : undefined;
+        if (wf) candidates.push(path.join(wf, 'dist', 'JarvisAgent.exe'));
+
+        // find the first existing candidate
+        let exePath: string | null = null;
+        for (const c of candidates) {
+            try {
+                if (fs.existsSync(c)) { exePath = c; break; }
+            } catch (e) {}
+        }
+
         try {
-            const python = process.platform === 'win32' ? 'python' : 'python3';
-            const script = context.asAbsolutePath('../../jarvis_desktop.py');
-            const child = cp.spawn(python, [script], {
-                detached: true,
-                stdio: 'ignore',
-                shell: false
-            });
-            child.unref();
-            vscode.window.showInformationMessage('JARVIS engine started.');
+            let child: any = null;
+            if (exePath) {
+                // Spawn the packaged executable
+                child = cp.spawn(exePath, [], { detached: true, stdio: 'ignore', shell: false });
+                child.unref();
+                vscode.window.showInformationMessage('JARVIS engine started (packaged executable).');
+                vscode.window.setStatusBarMessage('JARVIS: running (exe)', 5000);
+            } else {
+                // Fallback: spawn Python script
+                const python = process.platform === 'win32' ? 'python' : 'python3';
+                // attempt to resolve script relative to extension or workspace root
+                let script = context.asAbsolutePath('../../jarvis_desktop.py');
+                if (wf && fs.existsSync(path.join(wf, 'jarvis_desktop.py'))) script = path.join(wf, 'jarvis_desktop.py');
+                child = cp.spawn(python, [script], { detached: true, stdio: 'ignore', shell: false });
+                child.unref();
+                vscode.window.showInformationMessage('JARVIS engine started (python script).');
+                vscode.window.setStatusBarMessage('JARVIS: running (python)', 5000);
+            }
         } catch (err) {
             vscode.window.showErrorMessage('Failed to spawn JARVIS engine: ' + String(err));
         }
@@ -57,7 +83,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (chatApi && typeof chatApi.registerChatProvider === 'function') {
         const providerId = 'jarvis-local-provider';
         chatApi.registerChatProvider(providerId, {
-            async provideReply(conversation, message, cancellation, progressOrStream) {
+            async provideReply(conversation: any, message: any, cancellation: any, progressOrStream: any) {
                 // message contains text in message.text
                 const text = message?.text || '';
                 if (!text) return { items: [] };
@@ -78,8 +104,8 @@ export function activate(context: vscode.ExtensionContext) {
                     });
 
                     if (!resp.ok || !resp.body) {
-                        const data = await resp.json().catch(() => ({}));
-                        const reply = data.reply || `Error: ${resp.status}`;
+                        const data: any = await resp.json().catch(() => ({}));
+                        const reply = (data && data.reply) ? data.reply : `Error: ${resp.status}`;
                         return { items: [{ kind: 1, detail: 'JARVIS', text: reply, mime: 'text/markdown' }] };
                     }
 
@@ -226,9 +252,13 @@ canvas { width:100%; height:80px; background: rgba(255,255,255,0.03); border-rad
         }catch(e){ status.textContent = 'WS connection failed: ' + e.message; }
 
         function addProposal(p){
+            // avoid duplicates
+            if (!p || typeof p.index === 'undefined') return;
+            if (proposalsEl.querySelector('[data-proposal-index="' + p.index + '"]')) return;
             const container = document.createElement('div');
             container.className = 'proposal';
-            const title = document.createElement('div'); title.textContent = `#${p.index}: ${p.spec}`;
+            container.setAttribute('data-proposal-index', String(p.index));
+            const title = document.createElement('div'); title.textContent = '#' + p.index + ': ' + (p.spec || '');
             const pre = document.createElement('pre'); pre.textContent = p.preview || '';
             const reasons = document.createElement('div'); reasons.textContent = 'Reasons: ' + (p.reasons || []).join(', ');
             const approve = document.createElement('button'); approve.className='button'; approve.textContent='Approve & Inject';
@@ -236,7 +266,7 @@ canvas { width:100%; height:80px; background: rgba(255,255,255,0.03); border-rad
             approve.onclick = () => { actionProposal(p.index, true, container); };
             reject.onclick = () => { actionProposal(p.index, false, container); };
             container.appendChild(title); container.appendChild(pre); container.appendChild(reasons); container.appendChild(approve); container.appendChild(reject);
-            proposalsEl.appendChild(container);
+            proposalsEl.prepend(container);
         }
 
         async function actionProposal(index, confirm, container){
