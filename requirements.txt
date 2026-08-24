@@ -3,5 +3,12 @@ sounddevice>=0.4.6,<0.6
 elevenlabs>=1.50,<3
 websockets>=13
 python-dotenv>=1.0,<2
-pyttsx3
-chatbot
+pyttsx3>=2.90,<3
+Flask>=3.0,<4
+SpeechRecognition>=3.10,<4
+pyaudio>=0.2.14,<0.3; platform_system == "Windows"
+requests>=2.31,<3
+ollama>=0.1.0,<1
+psutil>=5.9,<7
+pvporcupine>=3.0.0,<4; platform_system == "Windows" or platform_system == "Linux"
+pyinstaller>=6.0,<7

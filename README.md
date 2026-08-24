@@ -1,73 +1,166 @@
-# Desktop clap → Jarvis-style welcome
+# JARVIS AI Agent
 
-Python script that listens to your default microphone and runs a **double-clap** welcome flow (Spotify, Chrome windows, ElevenLabs voice, Cursor). See constants at the top of `jarvis.py` for behavior and tuning.
+JARVIS is a desktop AI assistant for Windows designed to help you with voice interaction, command execution, project scaffolding, code review, and everyday task automation in a brief, formal style.
 
-## Setup
+It is designed to feel like a personal assistant that can:
+- listen and wake on voice phrases such as "Jarvis", "Hi Jarvis", or "Hey Jarvis"
+- respond in a calm, formal tone
+- execute direct OS and app commands
+- inspect code and propose improvements
+- scaffold new software projects and open them in VS Code
+- remember useful facts and previous conversations
+- work with local Ollama models or remote Claude/OpenAI-style APIs when configured
 
-From this project directory:
+## Quick start on Windows
 
-```bash
-python -m pip install -r requirements.txt
+Important: for the most stable microphone support, use Python 3.12 or 3.11. PyAudio is much more reliable there than on Python 3.14.
+
+1. Open PowerShell in the project folder.
+2. Run the installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
 ```
 
-## Environment variables
+3. Start the app:
 
-The script loads a **`.env` file** in the same folder as `jarvis.py` (via `python-dotenv`). You can also set variables in the shell.
+```powershell
+.\start_jarvis.bat
+```
 
-### Required (ElevenLabs welcome line)
+4. Open the browser at:
 
-| Variable | Purpose |
-| -------- | ------- |
-| `ELEVENLABS_API_KEY` | API key from [ElevenLabs](https://elevenlabs.io). |
-| `ELEVENLABS_VOICE_ID` | Voice ID from the ElevenLabs app (My Voices / library). |
+```text
+http://127.0.0.1:5000
+```
 
-Without these, the welcome speech is skipped (other actions may still run).
+5. Use the UI or talk to the assistant by voice after the wake phrase.
 
-### Optional
+## Features
 
-| Variable | Purpose |
-| -------- | ------- |
-| `ELEVENLABS_MODEL_ID` | TTS model (default in code: `eleven_multilingual_v2`). |
-| `ELEVENLABS_OUTPUT_FORMAT` | e.g. `pcm_24000` (must match playback expectations). |
-| `ELEVENLABS_PCM_SAMPLE_RATE` | Override PCM sample rate if it differs from the format name. |
-| `JARVIS_WELCOME_CACHE_DIR` | Custom folder for cached welcome WAV (default: `.cache/jarvis_welcome/` under the project). |
-| `JARVIS_INPUT_DEVICE` | Optional mic override: **integer** index or **substring** of the device name. If unset, the script uses the Windows default; when that mic is silent, it auto-picks the loudest working input. List devices: `python -c "import sounddevice as sd; print(sd.query_devices())"`. |
-| `CLAUDE_CODE_URL` | URL opened for Claude in Chrome (default: new chat). |
-| `TASARADAR_URL` | URL opened for Tasaradar in Chrome (default: `https://tasaradar.com`). `BINANCE_BTC_URL` is still read as a fallback if set. |
-| `CHROME_NEW_WINDOW_WAIT_S` | Seconds to wait for a new Chrome window on Windows (default `25`). |
-| `CHROME_WINDOW_WIDTH` / `CHROME_WINDOW_HEIGHT` | Windowed Chrome size when not fullscreen. |
+### Voice and hearing
+- microphone listening loop
+- wake phrase detection for "Jarvis", "Hi Jarvis", "Hey Jarvis"
+- optional clap detection support for local hardware setups
+- speech output through pyttsx3 TTS
 
-Example `.env`:
+### Intelligence and memory
+- SQLite-backed persistent chat history
+- lightweight semantic memory for recent context retrieval
+- intent classification before LLM calls
+- tool use for commands, code, and OS tasks
+
+### OS and coding tasks
+- open websites or local apps
+- close apps or windows
+- list processes and system status
+- analyze a file or project for maintainability issues
+- improve or refactor code suggestions
+- scaffold new Python projects and open them in VS Code
+
+### AI model support
+- local Ollama models via `OLLAMA_MODEL`
+- remote Claude/OpenAI-compatible providers via `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`
+- safe fallback responses when no model is configured
+
+## Recommended setup
+
+For the best experience, use one of these options:
+
+1. Local: install Ollama and run:
+
+```bash
+ollama serve
+ollama pull llama3.1
+```
+
+2. Cloud: set one of these in a `.env` file:
 
 ```env
-ELEVENLABS_API_KEY=your_key_here
-ELEVENLABS_VOICE_ID=your_voice_id_here
+ANTHROPIC_API_KEY=your_key_here
+# or
+OPENAI_API_KEY=your_key_here
 ```
 
-## Run
+The app will automatically use the configured provider when available.
 
-```bash
-python jarvis.py
+## Environment file
+
+A sample environment file is provided in `.env.example`.
+
+You can copy it to `.env` and edit values as needed:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
-Allow the microphone if Windows prompts you. Stop with **Ctrl+C**.
+Example:
 
-## Tuning
+```env
+OLLAMA_MODEL=llama3.1
+STT_LANGUAGE=en-US
+WAKE_WORD=jarvis
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+PORT=5000
+```
 
-Edit the constants at the top of `jarvis.py`:
+## Usage examples
 
-| Constant      | Effect                                                            |
-| ------------- | ----------------------------------------------------------------- |
-| `SPIKE_RATIO` | Increase if you get false triggers; decrease if claps are missed. |
-| `COOLDOWN_S`  | Minimum time between two logged claps.                            |
-| `BLOCK_MS`    | Larger = slightly less CPU, a bit less precise timing.            |
-| `MIN_RMS`     | Floor on how loud a block must be (helps in very quiet rooms).  |
-| `SAMPLE_RATE` | Try `48000` if your device does not like `44100`.                 |
+- "Jarvis, what is the system status?"
+- "Jarvis, open github"
+- "Jarvis, close all windows"
+- "Jarvis, create project my-app"
+- "Jarvis, analyze this file: src/main.py"
+- "Jarvis, improve this code for reliability"
+- "Jarvis, what can you do?"
+
+## Security notes
+
+- destructive OS actions should be used with care
+- the agent is designed for local desktop use; do not expose the web UI to public internet without hardening
+- avoid giving it unrestricted permissions to run any user-level system command in shared or production environments
 
 ## Troubleshooting
 
-- **Wrong or quiet mic:** On startup the script probes your default Windows input. If it is silent, it **auto-selects** the loudest working mic. To force a specific device, set `JARVIS_INPUT_DEVICE` in `.env` (index or name substring from `sounddevice.query_devices()`).
-- **PortAudio / audio errors:** Update audio drivers or try another `SAMPLE_RATE`.
-- **No reaction to claps:** Lower `SPIKE_RATIO` slightly or speak/clap closer to the mic.
-- **Spam logs:** Raise `SPIKE_RATIO` or `COOLDOWN_S`.
-- **No welcome speech:** Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env` and restart the terminal so variables load.
+### The assistant cannot reach the model
+This is normal when no local or cloud model is configured. JARVIS falls back to built-in command handling and brief formal responses automatically.
+
+### Voice does not wake up
+- confirm the microphone is connected and allowed in Windows
+- use a clear wake phrase such as "Jarvis"
+- if using a quiet room, move closer to the mic or lower the threshold in the wake logic
+
+### VS Code does not open
+Install the VS Code shell command (`code`) or start VS Code manually, then rerun the command.
+
+### Port 5000 is already in use
+Change the port in `.env`:
+
+```env
+PORT=6000
+```
+
+## Build to a Windows executable
+
+To make a standalone Windows program:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_windows_exe.ps1
+```
+
+This produces an executable in the `dist` folder.
+
+## Current project status
+
+The project is ready for local desktop use and for further extension. It already includes:
+- user-friendly web UI
+- persistent memory
+- wake detection logic
+- tool execution
+- code review and project scaffolding
+- VS Code integration
+
+## Support and next steps
+
+For deeper improvements, see [DEVELOPMENT.md](./DEVELOPMENT.md).
